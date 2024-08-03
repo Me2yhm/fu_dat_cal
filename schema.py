@@ -1,7 +1,9 @@
 import sqlite3
+from abc import ABC, abstractmethod
 
 import polars as pl
 import clickhouse_driver
+from numba.typed import List, Dict
 
 fields = (
     "symbol_id, datetime, open, high, low, close, volume, money, a1_v, a1_p, a2_v, a2_p"
@@ -103,6 +105,60 @@ class container:
 
 def get_index_tick(symbol_ids: list, db: str):
     iter_list = [dataIter(db, symbol_id, fields) for symbol_id in symbol_ids]
+
+
+class contractContainer(ABC):
+
+    def __init__(self, product: str, exchange: str, major: str):
+        self.exchange = exchange
+        self.product = product
+        self.mayjor = major
+        self.start_datetime = 0
+        self.iters = List()
+        self.new_tick = pl.DataFrame(
+            schema=[
+                ("symbol_id", pl.Utf8),
+                ("high", pl.Float64),
+                ("low", pl.Float64),
+                ("current", pl.Float64),
+                ("position", pl.Int64),
+                ("volume", pl.Float64),
+                ("money", pl.Float64),
+                ("a1_v", pl.Float64),
+                ("a1_p", pl.Float64),
+                ("a2_v", pl.Float64),
+                ("a2_p", pl.Float64),
+            ]
+        )
+        self.datetime = 0
+        self.iters_datetime = Dict()
+        self.mayjor_data = pl.DataFrame(
+            schema=[
+                ("symbol_id", pl.Utf8),
+                ("high", pl.Float64),
+                ("low", pl.Float64),
+                ("current", pl.Float64),
+                ("position", pl.Int64),
+                ("volume", pl.Float64),
+                ("money", pl.Float64),
+                ("a1_v", pl.Float64),
+                ("a1_p", pl.Float64),
+                ("a2_v", pl.Float64),
+                ("a2_p", pl.Float64),
+            ]
+        )
+
+    @abstractmethod
+    def roll_datetime(self):
+        """
+        roll to next half second
+        """
+
+    @abstractmethod
+    def add_tick(self):
+        """
+        add new tick to container
+        """
 
 
 if __name__ == "__main__":
