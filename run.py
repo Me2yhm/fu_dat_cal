@@ -1,43 +1,90 @@
+import time
 import polars as pl
 import functools
 import sqlite3
 from datetime import datetime, timedelta
 from multiprocessing import Pool
-
-import clickhouse_driver
-
-from utils import get_term
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
 
-@functools.lru_cache
-def get_conn():
+from utils import get_term, get_conn, timeit
+
+
+def get_last_trading_day(date: str) -> str:
     """
-    获取ClickHouse连接
+    获取上一个交易日
     """
-    clickhouse_uri = "clickhouse://reader:d9f6ed24@172.16.7.30:9900/joinquant"
-    conn = clickhouse_driver.Client.from_url(url=clickhouse_uri)
-    return conn
+    conn = get_conn()
+    sql = f"SELECT toDate('{date}') - INTERVAL 1 DAY"
+    last_trading_day = conn.execute(sql)[0][0]
+    return last_trading_day.strftime("%Y-%m-%d")
 
 
-def get_tick_dataframe(batch_size: int = 10000, offset: int = 0):
+def get_tick_dataframe(date: str = "2024-07-02"):
     """
     获取Tick数据
     """
     conn = get_conn()
+    start_datetime = get_last_trading_day(date) + "16:00:00"
+    end_datetime = date + "16:00:00"
     fields = "symbol_id,datetime,position,high,low,volume,current,a1_v,a1_p,b1_v,b1_p"
-    sql = f"select {fields} from jq.`tick` where match (symbol_id,'^[a-z]+\\d+.[A-Z]+$') limit {batch_size} offset {offset}"
+    sql = f"select {fields} from jq.`tick` where datetime >= '{start_datetime}' and datetime < '{end_datetime}' and match(symbol_id, '^[a-z]+\\d+.[A-Z]+$')'"
     rows = conn.execute(sql)
     df = pl.DataFrame(rows, schema=fields.split(","))
-    print(f"Got {batch_size} rows from ClickHouse at offset {offset}")
+    print(f"Got {date} data from ClickHouse at offset {offset}")
     return df
 
 
-def get_mayjor_contract(tick_df: pl.DataFrame) -> pl.DataFrame:
+@timeit
+def get_tick_multithread(offsets: list, batch_size: int = 10000):
+    """
+    多线程处理Tick数据
+    """
+    results = []
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = []
+        for offset in offsets:
+            futures.append(executor.submit(get_tick_dataframe, batch_size, offset))
+        for future in as_completed(futures):
+            try:
+                results.append(future.result())
+            except Exception as e:
+                print(f"Error fetching data for offset {offset}: {e}")
+    return results
+
+
+@timeit
+def get_tick_multiprocess(total_rows, batch_size):
+    offsets = range(0, total_rows, batch_size)
+    results = []
+    with ProcessPoolExecutor(max_workers=4) as executor:
+        offset_chunks = [offsets[i::4] for i in range(4)]
+        futures = [
+            executor.submit(get_tick_multithread, chunk, batch_size)
+            for chunk in offset_chunks
+        ]
+        for future in as_completed(futures):
+            results.extend(future.result())
+    return results
+
+
+def extract_future_data(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    提取期货数据
+    """
+    future_df = df[df["symbol_id"].str.contains(r"^[a-zA-Z]+\d{4}.[A-Z]+$")]
+    print(f"Extracted future data for len {len(future_df)}")
+    return future_df
+
+
+def get_mayjor_contract(
+    tick_df: pl.DataFrame, last_mayjor_contract: str
+) -> pl.DataFrame:
     """
     获取主力合约tick数据
     """
     major_tick_df = pl.DataFrame(schema=tick_df.schema)
-    mayjor_contract = ""
+    mayjor_contract = last_mayjor_contract
     timp_gro = tick_df.group_by("datetime")
     for time, df in timp_gro:
         if len(df) > 1:
@@ -101,7 +148,8 @@ def process_data(df: pl.DataFrame):
     # 保存数据到sqlite数据库
     for pro, dat in product_gro:
         dat.drop("letter_part")
-        save_db(dat, pro[0])
+        prcessed_dat = get_mayjor_contract(dat)
+        save_db(prcessed_dat, pro[0])
         print(f"Processed {pro[0]}")
 
 
@@ -125,18 +173,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
-    # df = get_tick_dataframe(batch_size=100000, offset=0)
-    # gropdf = group_by_product(df)
-    # c = 0
-    # for pro, dat in gropdf:
-    #     print(dat)
-    #     c += 1
-    #     if c == 3:
-    #         break
-    # product_gro = df.group_by("symbol_id")
-    # save_db(df, "future")
-    # print(df)
-    # for pro, dat in product_gro:
-    #     save_db(dat, pro[0])
-    #     break
+    # main()
+    offsets = [0, 100000, 200000, 300000, 400000, 500000, 600000, 700000, 800000]
+    # results = get_tick_multithread(offsets, 100000)
+    start_time = datetime.now()
+    for offset in offsets:
+        df = get_tick_dataframe(100000, offset)
+    endtime = datetime.now()
+    print(f"Total time: {endtime - start_time}")
