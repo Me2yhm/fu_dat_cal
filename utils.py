@@ -29,6 +29,16 @@ def timeit(func):
     return wrapper
 
 
+def get_last_trading_day(date: str) -> str:
+    """
+    获取上一个交易日
+    """
+    conn = get_conn()
+    sql = f"SELECT toDate('{date}') - INTERVAL 1 DAY"
+    last_trading_day = conn.execute(sql)[0][0]
+    return last_trading_day.strftime("%Y-%m-%d")
+
+
 def get_term(code: str) -> int:
     """
     get the term of future

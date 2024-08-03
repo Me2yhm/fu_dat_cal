@@ -7,22 +7,13 @@ from multiprocessing import Pool
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
 
-from utils import get_term, get_conn, timeit
-
-
-def get_last_trading_day(date: str) -> str:
-    """
-    获取上一个交易日
-    """
-    conn = get_conn()
-    sql = f"SELECT toDate('{date}') - INTERVAL 1 DAY"
-    last_trading_day = conn.execute(sql)[0][0]
-    return last_trading_day.strftime("%Y-%m-%d")
+from utils import get_last_trading_day, get_term, get_conn, timeit
 
 
 def get_tick_dataframe(date: str = "2024-07-02"):
     """
     获取Tick数据
+    date 需要为交易日。
     """
     conn = get_conn()
     start_datetime = get_last_trading_day(date) + "16:00:00"
