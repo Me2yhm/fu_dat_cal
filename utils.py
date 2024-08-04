@@ -53,6 +53,18 @@ def get_term(code: str) -> int:
         raise ValueError("Invalid code format. code may not be a future code.")
 
 
+def get_exchange(code: str) -> str:
+    """
+    get the exchange of future
+    """
+    pattern = r"[a-zA-Z]+(\d{4})\.[a-zA-Z]+"
+    match = re.search(pattern, code)
+    if match:
+        return code.split(".")[-1].upper()
+    else:
+        raise ValueError("Invalid code format. code may not be a future code.")
+
+
 def next_term(term: int) -> str:
     """
     get the next term of future

@@ -10,19 +10,19 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_compl
 from utils import get_last_trading_day, get_term, get_conn, timeit
 
 
-def get_tick_dataframe(date: str = "2024-07-02"):
+def get_tick_dataframe(date: str = "2024-07-19"):
     """
     获取Tick数据
     date 需要为交易日。
     """
     conn = get_conn()
-    start_datetime = get_last_trading_day(date) + "16:00:00"
-    end_datetime = date + "16:00:00"
-    fields = "symbol_id,datetime,position,high,low,volume,current,a1_v,a1_p,b1_v,b1_p"
-    sql = f"select {fields} from jq.`tick` where datetime >= '{start_datetime}' and datetime < '{end_datetime}' and match(symbol_id, '^[a-z]+\\d+.[A-Z]+$')'"
+    start_datetime = " ".join([get_last_trading_day(date), "16:00:00"])
+    end_datetime = " ".join([date, "16:00:00"])
+    fields = "symbol_id,datetime,position,current"
+    sql = f"select {fields} from jq.`tick` where datetime >= '{start_datetime}' and datetime < '{end_datetime}' and match(symbol_id, '^[a-z]+\\d+.[A-Z]+$')"
     rows = conn.execute(sql)
     df = pl.DataFrame(rows, schema=fields.split(","))
-    print(f"Got {date} data from ClickHouse at offset {offset}")
+    # print(f"Got {date} data from ClickHouse at offset {offset}")
     return df
 
 
