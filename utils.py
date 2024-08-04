@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta
 import functools
 import re
 import time
@@ -52,6 +53,20 @@ def get_term(code: str) -> int:
         raise ValueError("Invalid code format. code may not be a future code.")
 
 
+def next_term(term: int) -> str:
+    """
+    get the next term of future
+    """
+    str_term = str(term)
+    date_term = datetime(
+        year=int("".join(["20", str_term[:2]])),
+        month=int("".join(str_term[2:4])),
+        day=1,
+    )
+    next_term = date_term + timedelta(days=31)
+    return "".join([str(next_term.year)[-2:], str(next_term.month).zfill(2)])
+
+
 def get_last_close_dat(product: str, date: str) -> pl.DataFrame:
     """
     get the last close dat of the product
@@ -80,6 +95,19 @@ def get_last_contract(product: str, date: str) -> list:
     pass
 
 
+def get_nearest_hour(dt):
+    """
+    get the nearest hour of the given datetime object
+    """
+    hour = dt.hour
+    minute = dt.minute
+    if minute >= 30:
+        hour += 1
+    nearest_hour = dt.replace(hour=hour % 24, minute=0, second=0, microsecond=0)
+
+    return nearest_hour
+
+
 if __name__ == "__main__":
-    code = "2403.shfe"
-    print(get_term(code))
+    code = "ag2412.shfe"
+    print(next_term(get_term(code)))
