@@ -86,11 +86,37 @@ def get_last_close_dat(product: str, date: str) -> pl.DataFrame:
     pass
 
 
-def get_last_mayjor(product: str, date: str) -> str:
+def get_last_major(product: str, exchange: str, date: str = "2024-07-19") -> dict:
     """
-    get the last mayjor of the product
+    获取上一个主力合约
     """
-    pass
+    conn = get_conn()
+    fields = "symbol_id,datetime,current,position"
+    # 获得日线数据中主力合约和熟练合约的数据
+    sql = f"""
+            SELECT symbol_id, datetime,close, open_interest
+            FROM (
+                SELECT *, 
+                    COUNT(*) OVER (PARTITION BY open_interest) AS cnt
+                FROM (
+                    SELECT symbol_id, datetime,close, open_interest
+                    FROM jq.`1d`
+                    WHERE symbol_id LIKE '{product}____.DCE'
+                    AND symbol_id NOT LIKE '%8888%'
+                    AND datetime = '{date} 00:00:00'
+                ) AS subquery
+            ) AS main_query
+            WHERE cnt > 1;
+
+    """
+    rows = conn.execute(sql)
+    for row in rows:
+        if "9999" in row[0]:
+            last_tick = dict(zip(fields.split(","), row))
+        else:
+            last_major = dict(zip(fields.split(","), row))
+
+    return last_major, last_tick
 
 
 def get_last_secondery(product: str, date: str) -> str:
@@ -120,6 +146,38 @@ def get_nearest_hour(dt):
     return nearest_hour
 
 
+def get_all_contract(product: str, exchange: str, date: str = "2024-07-19") -> list:
+    """
+    获取所有合约
+    """
+    conn = get_conn()
+    sql = f"select symbol_id from jq.`1d` where datetime = '{date} 00:00:00'  and symbol_id like '{product}____.{exchange.upper()}';"
+    rows = conn.execute(sql)
+    symbol_ids = [row[0] for row in rows if get_term(row[0]) not in [9999, 8888, 7777]]
+    return symbol_ids
+
+
+def get_last_snapshot(
+    product: str, exchange: str, date: str = "2024-07-19"
+) -> pl.DataFrame:
+    """
+    获取上一个快照数据
+    date 需要为交易日。
+    """
+    conn = get_conn()
+    symbol_ids = get_all_contract(product, exchange, date)
+    start_datetime = " ".join([date, "08:59:00"])
+    end_datetime = " ".join([date, "21:00:00"])
+    fields = "symbol_id,datetime,position,current"
+    snapshot = pl.DataFrame(schema=fields.split(","))
+    for symbol_id in symbol_ids:
+        sql = f"select {fields} from jq.`tick` where datetime between '{start_datetime}' and  '{end_datetime}' and symbol_id = '{symbol_id}' order by datetime desc limit 1"
+        row = conn.execute(sql)
+        if not row:
+            continue
+        snapshot = pl.DataFrame(row, schema=fields.split(",")).vstack(snapshot)
+    return snapshot
+
+
 if __name__ == "__main__":
-    code = "ag2412.shfe"
-    print(next_term(get_term(code)))
+    print(get_last_trading_day("2024-07-22"))

@@ -7,7 +7,7 @@ import polars as pl
 import polars.selectors as cs
 from numba.typed import List, Dict
 
-from utils import get_term, next_term
+from utils import get_term, next_term, timeit
 
 fields = (
     "symbol_id, datetime, open, high, low, close, volume, money, a1_v, a1_p, a2_v, a2_p"
@@ -121,8 +121,8 @@ class mayjorContainer(contractContainer):
         self,
         product: str,
         exchange: str,
-        last_mayjor: Dict,
-        start_datetime,
+        last_mayjor: dict,
+        start_datetime: datetime,
         last_tick: dict,
     ) -> None:
         self.last_mayjor = last_mayjor
@@ -137,8 +137,11 @@ class mayjorContainer(contractContainer):
         self._assert_new_tick(newtick)
         if newtick["datetime"] < self.end_datetime:
             if self.check_new_mayjor(newtick):
+                self.last_mayjor["symbol_id"] = newtick["symbol_id"]
+                self.last_mayjor["position"] = newtick["position"]
                 newtick["symbol_id"] = self.symbol_id
                 self.last_tick = newtick
+
             else:
                 self.last_tick["datetime"] = newtick["datetime"]
             self.value = self.value.vstack(
@@ -152,11 +155,12 @@ class mayjorContainer(contractContainer):
         check if new tick is a new mayjor
         """
         if self.exchange != "INE":
-            condition1 = newtick["position"] > self.last_mayjor["position"]
+            condition1 = newtick["position"] >= self.last_mayjor["position"]
             condition2 = get_term(newtick["symbol_id"]) >= get_term(
                 self.last_mayjor["symbol_id"]
             )
-            return condition1 and condition2
+            condition3 = newtick["symbol_id"] == self.last_mayjor["symbol_id"]
+            return (condition1 and condition2) or condition3
         else:
             return self._is_latest_month_contract(
                 newtick["symbol_id"], newtick["datetime"]
@@ -183,13 +187,19 @@ class indexContainer(contractContainer):
     """
 
     def __init__(
-        self, product: str, exchange: str, last_snapshot: pl.DataFrame
+        self,
+        product: str,
+        exchange: str,
+        last_snapshot: pl.DataFrame,
+        start_datetime: datetime,
     ) -> None:
         self.last_snapshot = last_snapshot
         self.symbol_id = product + "8888." + exchange.upper()
         self.high = 0.0
         self.low = 0.0
-        super().__init__(product, exchange)
+        super().__init__(product, exchange, start_datetime)
+        self.value = self.value.drop("position")
+        self.weight = self.last_snapshot.select("position")
 
     def add_tick(self, newtick: Dict):
         """
@@ -197,10 +207,12 @@ class indexContainer(contractContainer):
         """
         self._assert_new_tick(newtick)
         if newtick["datetime"] < self.end_datetime:
-            self.date_time = newtick["datetime"]
             self.update_snapshot(newtick)
-            value = self.update_value()
-            self.value = self.value.vstack(value)
+            if self.date_time != newtick["datetime"]:
+                value = self.update_value()
+                # self.value = value.select(self.value.columns).vstack(self.value)
+                self.value = self.value.vstack(value.select(self.value.columns))
+            self.date_time = newtick["datetime"]
         else:
             pass
 
@@ -209,12 +221,16 @@ class indexContainer(contractContainer):
         upadate snapshot of all contracts
         """
         if newtick["symbol_id"] not in self.last_snapshot["symbol_id"]:
-            self.last_snapshot = self.last_snapshot.vstack(pl.DataFrame(newtick))
+            self.last_snapshot = self.last_snapshot.vstack(
+                pl.DataFrame(newtick, schema=self.last_snapshot.schema)
+            )
         condition1 = self.last_snapshot["symbol_id"] == newtick["symbol_id"]
         condition2 = self.last_snapshot["position"] == 0
+        del newtick["symbol_id"]
         self.last_snapshot = self.last_snapshot.select(
-            [
-                pl.when(condition1).then(newtick[col]).otherwise(pl.col(col).alias(col))
+            ["symbol_id"]
+            + [
+                pl.when(condition1).then(newtick[col]).otherwise(pl.col(col)).alias(col)
                 for col in newtick.keys()
             ]
         ).filter(~condition2)
@@ -225,6 +241,7 @@ class indexContainer(contractContainer):
         """
         condition = cs.numeric()
         numeric_snap = self.last_snapshot.select(condition)
+        # numeric_snap = numeric_snap.drop("position").hstack(self.weight)
         new_value = (
             numeric_snap.select(
                 [

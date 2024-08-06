@@ -19,10 +19,9 @@ def get_tick_dataframe(date: str = "2024-07-19"):
     start_datetime = " ".join([get_last_trading_day(date), "16:00:00"])
     end_datetime = " ".join([date, "16:00:00"])
     fields = "symbol_id,datetime,position,current"
-    sql = f"select {fields} from jq.`tick` where datetime >= '{start_datetime}' and datetime < '{end_datetime}' and match(symbol_id, '^[a-z]+\\d+.[A-Z]+$')"
+    sql = f"select {fields} from jq.`tick` where datetime between '{start_datetime}' and  '{end_datetime}' and match(symbol_id, '^[a-z]+\\d+.[A-Z]+$')"
     rows = conn.execute(sql)
     df = pl.DataFrame(rows, schema=fields.split(","))
-    # print(f"Got {date} data from ClickHouse at offset {offset}")
     return df
 
 
@@ -31,6 +30,7 @@ def get_tick_multithread(offsets: list, batch_size: int = 10000):
     """
     多线程处理Tick数据
     """
+    producnts = get
     results = []
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = []
@@ -108,23 +108,6 @@ def save_db(df: pl.DataFrame, product_id: str):
     conn = sqlite3.connect("C:\\用户\\newf4\\database\\future.db")
     cur = conn.cursor()
     print(product_id)
-    cur.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS {product_id} (
-            symbol_id TEXT,
-            datetime TEXT,
-            position INTEGER,
-            high NUMERIC,
-            low NUMERIC,
-            volume INTEGER,
-            current NUMERIC,
-            a1_v INTEGER,
-            a1_p NUMERIC,
-            b1_v INTEGER,
-            b1_p NUMERIC
-        )
-    """
-    )
     pandas_df = df.to_pandas()
     pandas_df.to_sql(product_id, conn, if_exists="append", index=False)
     conn.close()
