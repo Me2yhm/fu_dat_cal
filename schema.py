@@ -274,5 +274,196 @@ class indexContainer(contractContainer):
             self.low = value
 
 
+def assert_new_tick(newtick: Dict) -> None:
+    """
+    check if new tick is valid
+    """
+    for value in newtick.values():
+        try:
+            assert (
+                value is not None
+                and value != 0
+                and value != "0"
+                and value != "0.0"
+                and value != "None"
+                and value != "null"
+                and value != ""
+                and value != "nan"
+                and value != "NaN"
+                and value != "NAN"
+                and value != "NaT"
+                and value != "nat"
+                and value != "N/A"
+                and value != "n/a"
+                and value != "N/A N/A"
+                and value != "n/a n/a"
+                and value != "N/A N/A N/A"
+                and value != "n/a n/a n/a"
+                and value != "N/A N/A N/A N/A"
+                and value != "n/a n/a n/a n/a"
+            )
+        except AssertionError:
+            print(f"Invalid value: {newtick}")
+            raise AssertionError
+
+
+def check_new_mayjor(newtick: Dict, exchange: str, last_mayjor: dict) -> bool:
+    """
+    判断新进tick是否是新的主力合约tick
+    """
+    if exchange != "INE":
+        # 新进tick的合约代码就是主力合约代码，直接返回True
+        condition1 = newtick["symbol_id"] == last_mayjor["symbol_id"]
+        if condition1:
+            return True
+        # 新tick的持仓量大于主力合约的持仓量，且新tick的合约代码大于主力合约的合约代码，则返回True
+        condition2 = newtick["position"] >= last_mayjor["position"]
+        if condition2:
+            condition3 = get_term(newtick["symbol_id"]) >= get_term(
+                last_mayjor["symbol_id"]
+            )
+            return condition3
+        return False
+    else:
+        # 中金所的近月合约为主力合约
+        return _is_latest_month_contract(newtick["symbol_id"], newtick["datetime"])
+
+
+def _is_latest_month_contract(
+    symbol_id: str,
+    datetime: datetime,
+    last_mayjor: dict,
+    product: str,
+    exchange: str,
+) -> bool:
+    """
+    check if new tick is the latest month contract
+    """
+    year, month, day = datetime.year, datetime.month, datetime.day
+    expire_date = _get_expire_date(last_mayjor["symbol_id"])
+    if (year, month, day) > expire_date:
+        return symbol_id == (
+            product
+            + next_term(get_term(last_mayjor["symbol_id"]))
+            + "."
+            + exchange.upper()
+        )
+
+
+def _get_expire_date(symbol_id: str) -> Tuple[int, int, int]:
+    pass
+
+
+def upadate_major_tick(newtick: Dict, last_mayjor: dict, symbol_id: str):
+    """
+    add new tick to container
+    """
+    assert_new_tick(newtick)
+    if check_new_mayjor(newtick):
+        last_mayjor["symbol_id"] = newtick["symbol_id"]
+        last_mayjor["position"] = newtick["position"]
+        newtick["symbol_id"] = symbol_id
+        last_mayjor = newtick
+
+    else:
+        last_mayjor["datetime"] = newtick["datetime"]
+    return last_mayjor
+
+
+def upadate_index_tick(
+    newtick: Dict, last_snapshot: pl.DataFrame, symbol_id: str, high: float, low: float
+):
+    """
+    add new tick to container
+    """
+    assert_new_tick(newtick)
+    if newtick["datetime"] < last_snapshot["datetime"].max():
+        last_snapshot = last_snapshot.vstack(
+            pl.DataFrame(newtick, schema=last_snapshot.schema)
+        )
+    else:
+        last_snapshot = last_snapshot.vstack(
+            pl.DataFrame(
+                {
+                    "symbol_id": symbol_id,
+                    "datetime": newtick["datetime"],
+                    "open": newtick["open"],
+                    "high": newtick["high"],
+                    "low": newtick["low"],
+                    "close": newtick["close"],
+                    "volume": newtick["volume"],
+                    "money": newtick["money"],
+                    "position": 0,
+                },
+                schema=last_snapshot.schema,
+            )
+        )
+
+
+def update_extream(value: float, high: float, low: float) -> Tuple[float, float]:
+    """
+    update extream value of index contract
+    """
+    if value > high:
+        high = value
+    if value < low or low == 0.0:
+        low = value
+    return high, low
+
+
+def update_index_value(
+    last_snapshot: pl.DataFrame, symbol_id: str, high: float, low: float
+) -> pl.DataFrame:
+    """
+    update value of index contract
+    """
+    condition = cs.numeric()
+    numeric_snap = last_snapshot.select(condition)
+    new_value = (
+        numeric_snap.select(
+            [
+                pl.col(col) * pl.col("position")
+                for col in numeric_snap.columns
+                if col != "position"
+            ]
+        ).sum()
+        / numeric_snap["position"].sum()
+    )
+    high, low = update_extream(new_value["current"].item(), high, low)
+    lit_info = pl.DataFrame(
+        {
+            "symbol_id": symbol_id,
+            "datetime": new_value["datetime"],
+            "high": high,
+            "low": low,
+        }
+    )
+    new_value.hstack(lit_info, in_place=True)
+    return new_value
+
+
+def update_index_snapshot(
+    newtick: Dict, last_snapshot: pl.DataFrame, symbol_id: str
+) -> pl.DataFrame:
+    """
+    upadate snapshot of all contracts
+    """
+    if newtick["symbol_id"] not in last_snapshot["symbol_id"]:
+        last_snapshot = last_snapshot.vstack(
+            pl.DataFrame(newtick, schema=last_snapshot.schema)
+        )
+    condition1 = last_snapshot["symbol_id"] == newtick["symbol_id"]
+    condition2 = last_snapshot["position"] == 0
+    del newtick["symbol_id"]
+    last_snapshot = last_snapshot.select(
+        ["symbol_id"]
+        + [
+            pl.when(condition1).then(newtick[col]).otherwise(pl.col(col)).alias(col)
+            for col in newtick.keys()
+        ]
+    ).filter(~condition2)
+    return last_snapshot
+
+
 if __name__ == "__main__":
     pass

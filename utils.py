@@ -4,7 +4,10 @@ import re
 import time
 
 import polars as pl
+import numpy as np
 import clickhouse_driver
+
+from numba.typed import List
 
 
 @functools.lru_cache
@@ -101,7 +104,7 @@ def get_last_major(product: str, exchange: str, date: str = "2024-07-19") -> dic
                 FROM (
                     SELECT symbol_id, datetime,close, open_interest
                     FROM jq.`1d`
-                    WHERE symbol_id LIKE '{product}____.DCE'
+                    WHERE symbol_id LIKE '{product}____.{exchange.upper()}'
                     AND symbol_id NOT LIKE '%8888%'
                     AND datetime = '{date} 00:00:00'
                 ) AS subquery
@@ -126,13 +129,6 @@ def get_last_secondery(product: str, date: str) -> str:
     pass
 
 
-def get_last_contract(product: str, date: str) -> list:
-    """
-    get the last contract of the product
-    """
-    pass
-
-
 def get_nearest_hour(dt):
     """
     get the nearest hour of the given datetime object
@@ -146,7 +142,7 @@ def get_nearest_hour(dt):
     return nearest_hour
 
 
-def get_all_contract(product: str, exchange: str, date: str = "2024-07-19") -> list:
+def get_all_contracts(product: str, exchange: str, date: str = "2024-07-19") -> list:
     """
     获取所有合约
     """
@@ -154,28 +150,35 @@ def get_all_contract(product: str, exchange: str, date: str = "2024-07-19") -> l
     sql = f"select symbol_id from jq.`1d` where datetime = '{date} 00:00:00'  and symbol_id like '{product}____.{exchange.upper()}';"
     rows = conn.execute(sql)
     symbol_ids = [row[0] for row in rows if get_term(row[0]) not in [9999, 8888, 7777]]
-    return symbol_ids
+    return List(symbol_ids)
 
 
-def get_last_snapshot(
-    product: str, exchange: str, date: str = "2024-07-19"
-) -> pl.DataFrame:
+def creat_snapshot_array(length: int, columns: int) -> np.ndarray:
+    """
+    创建快照数组
+    """
+    # 快照数组里面没有symbol_id和datetime列
+    return np.zeros((length, columns), dtype=np.float64)
+
+
+def get_last_snapshot(symbol_ids: list, date: str = "2024-07-19") -> np.ndarray:
     """
     获取上一个快照数据
     date 需要为交易日。
     """
     conn = get_conn()
-    symbol_ids = get_all_contract(product, exchange, date)
-    start_datetime = " ".join([date, "08:59:00"])
+    start_datetime = " ".join([date, "15:00:00"])
     end_datetime = " ".join([date, "21:00:00"])
-    fields = "symbol_id,datetime,position,current"
-    snapshot = pl.DataFrame(schema=fields.split(","))
+    fields = "symbol_id,datetime,current,position"
+    snapshot = creat_snapshot_array(len(symbol_ids), len(fields.split(",")) - 2)
+    idx = 0
     for symbol_id in symbol_ids:
         sql = f"select {fields} from jq.`tick` where datetime between '{start_datetime}' and  '{end_datetime}' and symbol_id = '{symbol_id}' order by datetime desc limit 1"
         row = conn.execute(sql)
         if not row:
             continue
-        snapshot = pl.DataFrame(row, schema=fields.split(",")).vstack(snapshot)
+        snapshot[idx] = np.array(row[0][2:], dtype=np.float64)
+        idx += 1
     return snapshot
 
 
