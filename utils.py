@@ -1,13 +1,51 @@
 from datetime import datetime, timedelta
 import functools
+import json
+from pathlib import Path
 import re
+import sqlite3
 import time
 
+import numba
+import pandas as pd
 import polars as pl
 import numpy as np
 import clickhouse_driver
 
 from numba.typed import List
+
+parent_dir = Path(__file__).parent / "log"
+
+JSON_FILE = parent_dir / "records.json"
+
+
+def init_saved_records():
+    """
+    初始化保存的记录
+    """
+    conn = get_db_conn("future_1d")
+    cursor = conn.cursor()
+    rows = cursor.execute(
+        "SELECT name FROM sqlite_master WHERE type='table';"
+    ).fetchall()
+    saved_records = {row[0].split("_")[0]: [] for row in rows}
+    with open(JSON_FILE, "w") as json_file:
+        json.dump(saved_records, json_file)
+
+
+def dump_records(records: dict):
+    """
+    保存记录到文件
+    """
+    with open(JSON_FILE, "w") as json_file:
+        json.dump(records, json_file)
+
+
+# 从文件读取 JSON 数据并反序列化为字典对象
+def load_records() -> dict[str, list]:
+    with open(JSON_FILE, "r") as json_file:
+        data_from_file = json.load(json_file)
+    return data_from_file
 
 
 @functools.lru_cache
@@ -18,6 +56,32 @@ def get_conn():
     clickhouse_uri = "clickhouse://reader:d9f6ed24@172.16.7.30:9900/joinquant"
     conn = clickhouse_driver.Client.from_url(url=clickhouse_uri)
     return conn
+
+
+@functools.lru_cache(maxsize=None)
+def get_db_conn(db_name: str = "future_index") -> sqlite3.Connection:
+    """
+    获取sqlite数据库连接
+    """
+    conn = sqlite3.connect(f"C:\\用户\\newf4\\database\\{db_name}.db")
+    return conn
+
+
+def get_product_dict() -> dict[str, str]:
+    """
+    获得所有产品和交易所组成的字典
+    """
+    conn = get_db_conn("future_1d")
+    cursor = conn.cursor()
+    rows = cursor.execute(
+        "SELECT name FROM sqlite_master WHERE type='table';"
+    ).fetchall()
+    product_dict = {}
+    for row in rows:
+        product_name, exchange_name = row[0].split("_")
+        if product_name not in product_dict:
+            product_dict[product_name] = exchange_name
+    return product_dict
 
 
 def timeit(func):
@@ -33,14 +97,24 @@ def timeit(func):
     return wrapper
 
 
+def get_pro_dates(product: str, exchange: str) -> list:
+    """
+    获取指定品种的交易日列表
+    """
+    conn = get_db_conn("future_1d")
+    query = f"SELECT distinct Date(datetime) as date FROM {product}_{exchange} order by datetime asc"
+    df = pd.read_sql(query, conn, columns=["datetime"])
+    return df["date"].tolist()
+
+
 def get_last_trading_day(date: str) -> str:
     """
     获取上一个交易日
     """
-    conn = get_conn()
-    sql = f"SELECT toDate('{date}') - INTERVAL 1 DAY"
-    last_trading_day = conn.execute(sql)[0][0]
-    return last_trading_day.strftime("%Y-%m-%d")
+    conn = get_db_conn("future_1d")
+    sql = f"SELECT MAX(DATE(datetime)) as last_trading_day FROM a_DCE WHERE datetime < '{date} 00:00:00'"
+    last_trading_day = conn.execute(sql).fetchall()[0][0]
+    return last_trading_day
 
 
 def get_term(code: str) -> int:
@@ -147,15 +221,20 @@ def get_nearest_hour(dt):
 
 
 @timeit
-def get_all_contracts(product: str, exchange: str, date: str = "2024-07-19") -> list:
+def get_all_contracts(
+    product: str, exchange: str, date: str = "2024-07-19"
+) -> np.ndarray:
     """
     获取所有合约
     """
-    conn = get_conn()
-    sql = f"select symbol_id from jq.`1d` where datetime = '{date} 00:00:00'  and symbol_id like '{product}____.{exchange.upper()}';"
-    rows = conn.execute(sql)
-    symbol_ids = [row[0] for row in rows if get_term(row[0]) not in [9999, 8888, 7777]]
-    return List(symbol_ids)
+    conn = get_db_conn("future_1d")
+    cursor = conn.cursor()
+    sql = f"select symbol_id from {product}_{exchange} where datetime = '{date} 00:00:00';"
+    rows = cursor.execute(sql).fetchall()
+    symbol_ids = List.empty_list(numba.types.unicode_type)
+    for row in rows:
+        symbol_ids.append(row[0])
+    return symbol_ids
 
 
 def creat_snapshot_array(length: int, columns: int) -> np.ndarray:

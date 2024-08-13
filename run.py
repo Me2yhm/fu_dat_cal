@@ -10,17 +10,24 @@ from numba import njit, types
 from numba.typed import Dict
 
 from utils import (
+    dump_records,
     get_all_contracts,
     get_last_snapshot,
     get_last_trading_day,
+    get_pro_dates,
+    get_product_dict,
     get_term,
     get_conn,
+    get_db_conn,
+    load_records,
     timeit,
 )
+from logger import Logger, setup_logger
 
 SYMBOL_IDX: Dict[str, int] = Dict.empty(
     key_type=types.unicode_type, value_type=types.int64
 )
+RECORDS = load_records()
 
 
 @functools.lru_cache(maxsize=None)  # 使用 LRU 缓存
@@ -55,7 +62,7 @@ def get_symbols_tick(
     conn = get_conn()
     start_datetime = " ".join([get_last_trading_day(date), "21:00:00"])
     end_datetime = " ".join([date, "16:00:00"])
-    sql = f"select {fields} from jq.`tick` where datetime between '{start_datetime}' and  '{end_datetime}' and symbol_id in {tuple(symbols)} order by datetime asc;"
+    sql = f"select {fields} from jq.`tick` where datetime between '{start_datetime}' and  '{end_datetime}' and symbol_id in {tuple(symbols)};"
     rows = conn.execute(sql, columnar=True)
     df = pl.DataFrame(rows, schema=fields.split(","))
     return df
@@ -73,15 +80,15 @@ def get_1d_dat(condition: str = ""):
     return df
 
 
-def save_1d_dat(df: pl.DataFrame):
+def save_1d_dat(df: pl.DataFrame, product: str, exchange: str):
     """
     保存日线数据到sqlite数据库
     """
-    conn = sqlite3.connect("C:\\用户\\newf4\\database\\future.db")
+    conn = sqlite3.connect("C:\\用户\\newf4\\database\\future_1d.db")
     cur = conn.cursor()
     pandas_df = df.to_pandas()
     pandas_df["datetime"] = pandas_df["datetime"].astype("datetime64[us]")
-    pandas_df.to_sql("1d", conn, if_exists="append", index=False)
+    pandas_df.to_sql(f"{product}_{exchange}", conn, if_exists="append", index=False)
     conn.close()
 
 
@@ -154,19 +161,13 @@ def group_by_product(df: pl.DataFrame):
     按产品分组
     """
     df = df.with_columns(
-        pl.col("symbol_id").str.extract(r"([a-z]+)", 1).alias("letter_part")
+        pl.col("symbol_id").str.extract(r"(^[a-zA-Z]+)", 1).alias("pro_part")
     )
-    product_gro = df.group_by("letter_part")
+    df = df.with_columns(
+        pl.col("symbol_id").str.extract(r"([A-Z]+)$", 1).alias("exchange")
+    )
+    product_gro = df.group_by("pro_part")
     return product_gro
-
-
-@functools.lru_cache(maxsize=None)
-def get_db_conn(db_name: str = "future_index") -> sqlite3.Connection:
-    """
-    获取sqlite数据库连接
-    """
-    conn = sqlite3.connect(f"C:\\用户\\newf4\\database\\{db_name}.db")
-    return conn
 
 
 @timeit
@@ -183,7 +184,7 @@ def save_db(
     if isinstance(df, pl.DataFrame):
         df = df.to_pandas()
     df.to_sql(product_id, conn, if_exists="append", index=False)
-    print(f"saved {product_id} of {date} to {db_name} successfully")
+    Logger.info(f"saved {product_id} of {date} data to {db_name} successfully")
 
 
 def process_data(df: pl.DataFrame):
@@ -202,8 +203,16 @@ def process_data(df: pl.DataFrame):
 
 @timeit
 def execute_1d_extract():
-    df = get_1d_dat()
-    # save_1d_dat(df)
+    condition = "where match(symbol_id,'^[a-zA-Z]+\\d+.CZCE$') and symbol_id not like '%8888%' and symbol_id not like '%9999%';"
+    df = get_1d_dat(condition)
+    product_gro = group_by_product(df)
+    logg = setup_logger("day", "1d_extract.log")
+    for pro, dat in product_gro:
+        exchange = dat["exchange"][0]
+        dat = dat.drop("pro_part")
+        dat = dat.sort("datetime")
+        save_1d_dat(dat, pro[0], exchange)
+        logg.info(f"Saved {pro[0]} of {exchange} data to 1d_dat.db successfully")
 
 
 @njit(nopython=True)
@@ -226,11 +235,12 @@ def creat_snapshot_array(length: int, columns: int) -> np.ndarray:
 
 @timeit
 @njit(nopython=True)
-def creat_symbol_index(symbol_ids: list, index_dict: Dict[str, int]) -> dict:
+def creat_symbol_index(symbol_ids: np.ndarray, index_dict: Dict[str, int]) -> dict:
     """
     创建symbol_id索引
     """
     for i, symbol_id in enumerate(symbol_ids):
+        # symbol_id = f"{symbol_id}"
         index_dict[symbol_id] = i
     return index_dict
 
@@ -294,21 +304,26 @@ def execute_single_pro(
 
 
 @timeit
-def main(date: str = "2024-07-19", product: str = "ag", exchange: str = "SHFE"):
+def save_1d_index(
+    date: str = "2024-07-19", product: str = "ag", exchange: str = "SHFE"
+):
     """
     主函数
     """
     global SYMBOL_IDX
+    if date in RECORDS[product]:
+        Logger.warning(f"{date} {product} of {exchange} data has been processed")
+        return
     # 新合约的处理：空行填充
-    symbol_id = f"{product}8888.{exchange}"
     fields = "symbol_id,datetime,current,a1_v,a1_p,b1_v,b1_p,position"
     symbol_ids = get_all_contracts(product, exchange, date)
-    SYMBOL_IDX = creat_symbol_index(symbol_ids, SYMBOL_IDX)
-    snap_shots = get_last_snapshot(symbol_ids, get_last_trading_day(date), fields)
-    tick_data = get_symbols_tick(symbol_ids, date, fields).to_pandas(
-        use_pyarrow_extension_array=True
+    tick_data = (
+        get_symbols_tick(symbol_ids, date, fields)
+        .to_pandas(use_pyarrow_extension_array=True)
+        .sort_values(by="datetime")
     )  # tick_df 的列顺序需要和snapshot保持一致
-
+    snap_shots = get_last_snapshot(symbol_ids, get_last_trading_day(date), fields)
+    SYMBOL_IDX = creat_symbol_index(symbol_ids, SYMBOL_IDX)
     # 为什么main在第一次调用时很慢？如果symbol_idx不用全局变量会更快？
     tick_data["symbol_id"] = tick_data["symbol_id"].apply(get_symbol_index)
     tick_data["datetime"] = (
@@ -321,11 +336,46 @@ def main(date: str = "2024-07-19", product: str = "ag", exchange: str = "SHFE"):
         columns=["symbol_id", "datetime"] + fields.split(",")[2:] + ["high", "low"],
     )
     index_df["datetime"] = index_df["datetime"].astype("datetime64[s]")
-    index_df["symbol_id"] = symbol_id
-    save_db(index_df, product, date)
+    index_df["symbol_id"] = f"{product}8888.{exchange}"
+    # save_db(index_df, product, date)
+    # RECORDS[product].append(date)
+    # dump_records(RECORDS)
+
+
+def process_single_product(product: str, exchange: str):
+    """
+    处理单个产品
+    """
+    date_lst = get_pro_dates(product, exchange)
+    results = []
+    with ThreadPoolExecutor() as executor:
+        futures = []
+        for date in date_lst:
+            futures.append(executor.submit(save_1d_index, date, product, exchange))
+        for future in as_completed(futures):
+            try:
+                results.append(future.result())
+            except Exception as e:
+                print(f"Error processing {product} {exchange} {date}: {e}")
+    return results
+
+
+@timeit
+def main():
+    """
+    主函数
+    """
+    prodct_dct = get_product_dict()
+    results = []
+    with ProcessPoolExecutor() as executor:
+        futures = [
+            executor.submit(process_single_product, product, exchange)
+            for product, exchange in prodct_dct.items()
+        ]
+        for future in as_completed(futures):
+            results.extend(future.result())
+    return results
 
 
 if __name__ == "__main__":
-    main("2024-07-22")
-    main("2024-07-22", "pp", "DCE")
-    main("2024-07-17")
+    execute_1d_extract()
