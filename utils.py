@@ -142,6 +142,7 @@ def get_nearest_hour(dt):
     return nearest_hour
 
 
+@timeit
 def get_all_contracts(product: str, exchange: str, date: str = "2024-07-19") -> list:
     """
     获取所有合约
@@ -161,6 +162,7 @@ def creat_snapshot_array(length: int, columns: int) -> np.ndarray:
     return np.zeros((length, columns), dtype=np.float64)
 
 
+@timeit
 def get_last_snapshot(symbol_ids: list, date: str = "2024-07-19") -> np.ndarray:
     """
     获取上一个快照数据

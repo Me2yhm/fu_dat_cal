@@ -20,6 +20,10 @@ from utils import (
     timeit,
 )
 
+SYMBOL_IDX: Dict[str, int] = Dict.empty(
+    key_type=types.unicode_type, value_type=types.int64
+)
+
 
 def get_tick_dataframe(date: str = "2024-07-19"):
     """
@@ -36,6 +40,7 @@ def get_tick_dataframe(date: str = "2024-07-19"):
     return df
 
 
+@timeit
 def get_symbols_tick(symbols: list, date: str = "2024-07-19"):
     """
     获取指定若干合约的Tick数据
@@ -199,15 +204,15 @@ def creat_snapshot_array(length: int, columns: int) -> np.ndarray:
     return np.zeros((length, columns), dtype=np.float64)
 
 
+@timeit
 @njit(nopython=True)
-def creat_symbol_index(symbol_ids: list) -> dict:
+def creat_symbol_index(symbol_ids: list, index_dict: Dict[str, int]) -> dict:
     """
     创建symbol_id索引
     """
-    index = Dict.empty(key_type=types.unicode_type, value_type=types.int64)
     for i, symbol_id in enumerate(symbol_ids):
-        index[symbol_id] = i
-    return index
+        index_dict[symbol_id] = i
+    return index_dict
 
 
 @njit(nopython=True)
@@ -225,7 +230,6 @@ def cal_value(snapshot: np.ndarray, datetime: datetime):
 @timeit
 @njit(nopython=True)
 def execute_single_pro(
-    symbol_ids: List,
     snap_shots: np.ndarray,
     tick_data: np.ndarray,
 ):
@@ -235,7 +239,6 @@ def execute_single_pro(
     """
     values = creat_value_array(3)
     value_index = 0
-    symbol_idx = creat_symbol_index(symbol_ids)
     last_datetime = tick_data[0][1]  # datetime 精度为10ms
     # 循环之前几乎占据一般的时间，需要优化
     for row in tick_data:
@@ -259,33 +262,33 @@ def execute_single_pro(
 
 
 @timeit
-def main(date: str = "2024-07-19"):
+def main(date: str = "2024-07-19", product: str = "ag", exchange: str = "SHFE"):
     """
     主函数
     """
-    symbol_ids = get_all_contracts("pp", "DCE", date)
-    symbol_idx = creat_symbol_index(symbol_ids)
+    symbol_ids = get_all_contracts(product, exchange, date)
+    symbol_idx = creat_symbol_index(symbol_ids, SYMBOL_IDX)
     snap_shots = get_last_snapshot(symbol_ids, get_last_trading_day(date))
     tick_data = get_symbols_tick(symbol_ids, date).to_pandas(
         use_pyarrow_extension_array=True
     )  # tick_df 的列顺序需要和snapshot保持一致
+
+    @timeit
+    def test(tick_data):
+
+        tick_data["symbol_id"] = tick_data["symbol_id"].apply(lambda x: symbol_idx[x])
+
+        return tick_data
+
+    tick_data = test(tick_data)
     tick_data["datetime"] = (
         tick_data["datetime"].apply(lambda x: x.timestamp()).round(1)
     )
-    tick_data["symbol_id"] = tick_data["symbol_id"].apply(lambda x: symbol_idx[x])
     tick_data = tick_data.to_records(index=False, column_dtypes={"symbol_id": "int64"})
-    values = execute_single_pro(symbol_ids, snap_shots, tick_data)
-    print(values.shape)
-    for i in range(values.shape[0]):
-        dt = values[i][0]
-        dt = pd.to_datetime(dt, unit="s")
-        if dt >= pd.to_datetime(f"{date} 15:00:00"):
-            print(dt)
-            print(values[i])
-            break
+    values = execute_single_pro(snap_shots, tick_data)
 
 
 if __name__ == "__main__":
     main()
-    main("2024-07-18")
-    main("2024-07-17")
+    # main("2024-07-18", "pp", "DCE")
+    # main("2024-07-17")
