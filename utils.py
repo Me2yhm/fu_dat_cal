@@ -89,12 +89,16 @@ def get_last_close_dat(product: str, date: str) -> pl.DataFrame:
     pass
 
 
-def get_last_major(product: str, exchange: str, date: str = "2024-07-19") -> dict:
+def get_last_major(
+    product: str,
+    exchange: str,
+    date: str = "2024-07-19",
+    fields: str = "symbol_id,datetime,close,open_interest",
+) -> dict:
     """
     获取上一个主力合约
     """
     conn = get_conn()
-    fields = "symbol_id,datetime,current,position"
     # 获得日线数据中主力合约和熟练合约的数据
     sql = f"""
             SELECT symbol_id, datetime,close, open_interest
@@ -102,7 +106,7 @@ def get_last_major(product: str, exchange: str, date: str = "2024-07-19") -> dic
                 SELECT *, 
                     COUNT(*) OVER (PARTITION BY open_interest) AS cnt
                 FROM (
-                    SELECT symbol_id, datetime,close, open_interest
+                    SELECT {fields}
                     FROM jq.`1d`
                     WHERE symbol_id LIKE '{product}____.{exchange.upper()}'
                     AND symbol_id NOT LIKE '%8888%'
@@ -163,7 +167,11 @@ def creat_snapshot_array(length: int, columns: int) -> np.ndarray:
 
 
 @timeit
-def get_last_snapshot(symbol_ids: list, date: str = "2024-07-19") -> np.ndarray:
+def get_last_snapshot(
+    symbol_ids: list,
+    date: str = "2024-07-19",
+    fields: str = "symbol_id,datetime,current,position",
+) -> np.ndarray:
     """
     获取上一个快照数据
     date 需要为交易日。
@@ -171,13 +179,13 @@ def get_last_snapshot(symbol_ids: list, date: str = "2024-07-19") -> np.ndarray:
     conn = get_conn()
     start_datetime = " ".join([date, "15:00:00"])
     end_datetime = " ".join([date, "21:00:00"])
-    fields = "symbol_id,datetime,current,position"
     snapshot = creat_snapshot_array(len(symbol_ids), len(fields.split(",")) - 2)
     idx = 0
     for symbol_id in symbol_ids:
         sql = f"select {fields} from jq.`tick` where datetime between '{start_datetime}' and  '{end_datetime}' and symbol_id = '{symbol_id}' order by datetime desc limit 1"
         row = conn.execute(sql)
         if not row:
+            idx += 1
             continue
         snapshot[idx] = np.array(row[0][2:], dtype=np.float64)
         idx += 1
