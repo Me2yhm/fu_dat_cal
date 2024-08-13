@@ -25,6 +25,11 @@ SYMBOL_IDX: Dict[str, int] = Dict.empty(
 )
 
 
+@functools.lru_cache(maxsize=None)  # 使用 LRU 缓存
+def get_symbol_index(symbol: str):
+    return SYMBOL_IDX[symbol]
+
+
 def get_tick_dataframe(date: str = "2024-07-19"):
     """
     获取Tick数据
@@ -266,21 +271,16 @@ def main(date: str = "2024-07-19", product: str = "ag", exchange: str = "SHFE"):
     """
     主函数
     """
+    global SYMBOL_IDX
     symbol_ids = get_all_contracts(product, exchange, date)
-    symbol_idx = creat_symbol_index(symbol_ids, SYMBOL_IDX)
+    SYMBOL_IDX = creat_symbol_index(symbol_ids, SYMBOL_IDX)
     snap_shots = get_last_snapshot(symbol_ids, get_last_trading_day(date))
     tick_data = get_symbols_tick(symbol_ids, date).to_pandas(
         use_pyarrow_extension_array=True
     )  # tick_df 的列顺序需要和snapshot保持一致
 
-    @timeit
-    def test(tick_data):
-
-        tick_data["symbol_id"] = tick_data["symbol_id"].apply(lambda x: symbol_idx[x])
-
-        return tick_data
-
-    tick_data = test(tick_data)
+    # 为什么main在第一次调用时很慢？如果symbol_idx不用全局变量会更快？
+    tick_data["symbol_id"] = tick_data["symbol_id"].apply(get_symbol_index)
     tick_data["datetime"] = (
         tick_data["datetime"].apply(lambda x: x.timestamp()).round(1)
     )
@@ -290,5 +290,5 @@ def main(date: str = "2024-07-19", product: str = "ag", exchange: str = "SHFE"):
 
 if __name__ == "__main__":
     main()
-    # main("2024-07-18", "pp", "DCE")
-    # main("2024-07-17")
+    main("2024-07-18", "pp", "DCE")
+    main("2024-07-17")
