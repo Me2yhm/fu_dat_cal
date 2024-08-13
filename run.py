@@ -212,7 +212,7 @@ def execute_1d_extract():
         dat = dat.drop("pro_part")
         dat = dat.sort("datetime")
         save_1d_dat(dat, pro[0], exchange)
-        logg.info(f"Saved {pro[0]} of {exchange} data to 1d_dat.db successfully")
+        logg.info(f"Saved {pro[0]} of {exchange} data to future_1d.db successfully")
 
 
 @njit(nopython=True)
