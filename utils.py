@@ -13,6 +13,8 @@ import numpy as np
 import clickhouse_driver
 
 from numba.typed import List
+import pymongo
+import pymongo.collection
 
 from logger import Logger, setup_logger
 
@@ -35,6 +37,12 @@ def init_saved_records():
         json.dump(saved_records, json_file)
 
 
+@functools.lru_cache(maxsize=1)
+def get_db() -> pymongo.collection:
+    mongodb_url = "mongodb://quote_rw:rx5cb0g3myoiw30g@172.16.7.31:27027/Quote"
+    return pymongo.MongoClient(mongodb_url)["Quote"]
+
+
 def dump_records(records: dict, lock):
     """
     保存记录到文件
@@ -49,6 +57,27 @@ def load_records() -> dict[str, list]:
     with open(JSON_FILE, "r") as json_file:
         data_from_file = json.load(json_file)
     return data_from_file
+
+
+def insert_records(product: str, exchange: str, date: str):
+    """
+    插入记录到mongodb
+    """
+    db = get_db()
+    record = {"product": product, "exchange": exchange, "date": date}
+    if db.find_one(record):
+        print(f"Record {record} already exists in database.")
+        return
+    db.insert_one(record)
+
+
+def is_processed(product: str, date: str) -> bool:
+    """
+    判断记录是否已经处理过
+    """
+    record = {"product": product, "date": date}
+    db = get_db()
+    return bool(db.find_one(record))
 
 
 @functools.lru_cache

@@ -17,6 +17,8 @@ from utils import (
     get_pro_dates,
     get_product_dict,
     get_symbols_tick,
+    insert_records,
+    is_processed,
     load_records,
     save_db,
     timeit,
@@ -102,13 +104,13 @@ def execute_single_pro(
 
 @timeit
 def save_1d_index(
-    lock, date: str = "2024-07-19", product: str = "ag", exchange: str = "SHFE"
+    date: str = "2024-07-19", product: str = "ag", exchange: str = "SHFE"
 ):
     """
     主函数
     """
-    RECORDS = load_records()
-    if date in RECORDS[product]:
+    record = {"product": product, "exchange": exchange, "date": date}
+    if is_processed(record):
         Logger.warning(f"{date} {product} of {exchange} data has been processed")
         return
     # 新合约的处理：空行填充
@@ -143,12 +145,12 @@ def save_1d_index(
     index_df["datetime"] = index_df["datetime"].astype("datetime64[ms]")
     index_df["symbol_id"] = f"{product}8888.{exchange}"
     print(index_df.tail())
-    # save_db(index_df, product, date)
-    # RECORDS[product].append(date)
-    dump_records(RECORDS, lock)
+    save_db(index_df, product, date)
+    insert_records(record)
+    return f"{product}8888.{exchange}-{date}"
 
 
-def process_single_product(product: str, exchange: str, lock):
+def process_single_product(product: str, exchange: str):
     """
     处理单个产品
     """
@@ -157,9 +159,7 @@ def process_single_product(product: str, exchange: str, lock):
     with ThreadPoolExecutor() as executor:
         futures = []
         for date in date_lst:
-            futures.append(
-                executor.submit(save_1d_index, lock, date, product, exchange)
-            )
+            futures.append(executor.submit(save_1d_index, date, product, exchange))
         for future in as_completed(futures):
             try:
                 results.append(future.result())
@@ -175,18 +175,15 @@ def main():
     """
     prodct_dct = get_product_dict()
     results = []
-    with multiprocessing.Manager() as manager:
-        lock = manager.Lock()
-        with ProcessPoolExecutor() as executor:
-            futures = [
-                executor.submit(process_single_product, product, exchange, lock)
-                for product, exchange in prodct_dct.items()
-            ]
-            for future in as_completed(futures):
-                results.extend(future.result())
+    with ProcessPoolExecutor() as executor:
+        futures = [
+            executor.submit(process_single_product, product, exchange)
+            for product, exchange in prodct_dct.items()
+        ]
+        for future in as_completed(futures):
+            results.append(future.result())
     return results
 
 
 if __name__ == "__main__":
-    lock = multiprocessing.Lock()
-    save_1d_index(lock, product="pp", exchange="DCE", date="2024-07-19")
+    save_1d_index(product="pp", exchange="DCE", date="2024-07-19")
