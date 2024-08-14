@@ -416,5 +416,38 @@ def save_1d_dat(df: pl.DataFrame, product: str, exchange: str):
     conn.close()
 
 
+def get_product_comma(product: str) -> str:
+    """
+    获取品种代码
+    """
+    return f"{product.upper()},"
+
+
+def in_trade_times(symbol: str, hms: int):
+    product = get_product_comma(symbol)
+    if product in "IM,IH,IC,IF,":
+        return 93000 <= hms < 112930 or 130000 <= hms < 150001
+
+    if product in "T,TS,TL,TF,":
+        return 93000 <= hms < 110001 or 130000 <= hms < 151501
+
+    if 90000 <= hms < 101501 or 103000 < hms < 113001 or 133000 < hms < 150001:
+        return True
+
+    if product in "AU,AG,SC,":
+        return 0 <= hms < 22930 or 210000 <= hms < 240000
+
+    if product in "CU,PB,AL,ZN,SN,NI,SS,AO,BC":
+        return 0 <= hms < 10001 or 210000 <= hms < 240000
+
+    if (
+        product
+        in "FG,SA,SH,PX,MA,SR,TA,RM,OI,CF,CY,PF,ZC,I,J,JM,A,B,MA,P,Y,C,CS,PP,V,EB,EG,PG,RR,L,FU,RU,BR,BU,SP,RB,HC,LU,NR,"
+    ):
+        return 210000 <= hms < 230001
+
+    return False
+
+
 if __name__ == "__main__":
     print(get_last_trading_day("2024-07-22"))

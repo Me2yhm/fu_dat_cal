@@ -1,16 +1,11 @@
-import multiprocessing
 import polars as pl
 import pandas as pd
 import numpy as np
-import functools
-import sqlite3
-from multiprocessing import Pool
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
 from numba import njit, types
 
 from utils import (
-    dump_records,
     get_all_contracts,
     get_last_snapshot,
     get_last_trading_day,
@@ -19,7 +14,6 @@ from utils import (
     get_symbols_tick,
     insert_records,
     is_processed,
-    load_records,
     save_db,
     timeit,
 )
@@ -70,7 +64,7 @@ def execute_single_pro(
     tick_data: np.ndarray,
 ):
     """
-    执行单个产品的处理
+    执行单个产品一天的指数数据的处理
     开盘价与同花顺不同，怀疑是集合竞价导致？
     """
     values = creat_value_array(snap_shots.shape[1] + 4)
@@ -159,29 +153,35 @@ def process_single_product(product: str, exchange: str):
     with ThreadPoolExecutor() as executor:
         futures = []
         for date in date_lst:
-            futures.append(executor.submit(save_1d_index, date, product, exchange))
-        for future in as_completed(futures):
+            futures.append(
+                (date, executor.submit(save_1d_index, date, product, exchange))
+            )
+        for date, future in as_completed(futures):
             try:
                 results.append(future.result())
             except Exception as e:
-                print(f"Error processing {product} {exchange} {date}: {e}")
-    return results
+                print(f"Thread Error: {product} {exchange} {date}: {e}")
+    return results, product
 
 
 @timeit
-def main():
+def cal_future_index():
     """
-    主函数
+    计算期货指数主函数
     """
     prodct_dct = get_product_dict()
-    results = []
+    results = {}
     with ProcessPoolExecutor() as executor:
         futures = [
-            executor.submit(process_single_product, product, exchange)
+            (product, executor.submit(process_single_product, product, exchange))
             for product, exchange in prodct_dct.items()
         ]
-        for future in as_completed(futures):
-            results.append(future.result())
+        for product, future in as_completed(futures):
+            try:
+                result, pro = future.result()
+                results[pro] = result
+            except Exception as e:
+                print(f"Processe Error {product}: {e}")
     return results
 
 
