@@ -14,6 +14,8 @@ import clickhouse_driver
 
 from numba.typed import List
 
+from logger import Logger, setup_logger
+
 parent_dir = Path(__file__).parent / "log"
 
 JSON_FILE = parent_dir / "records.json"
@@ -33,12 +35,13 @@ def init_saved_records():
         json.dump(saved_records, json_file)
 
 
-def dump_records(records: dict):
+def dump_records(records: dict, lock):
     """
     保存记录到文件
     """
-    with open(JSON_FILE, "w") as json_file:
-        json.dump(records, json_file)
+    with lock:
+        with open(JSON_FILE, "w") as json_file:
+            json.dump(records, json_file)
 
 
 # 从文件读取 JSON 数据并反序列化为字典对象
@@ -53,7 +56,7 @@ def get_conn():
     """
     获取ClickHouse连接
     """
-    clickhouse_uri = "clickhouse://reader:d9f6ed24@172.16.7.30:9900/joinquant"
+    clickhouse_uri = "clickhouse://reader:d9f6ed24@172.16.7.30:9900/jq?compression=lz4&use_numpy=true"
     conn = clickhouse_driver.Client.from_url(url=clickhouse_uri)
     return conn
 
@@ -207,6 +210,28 @@ def get_last_secondery(product: str, date: str) -> str:
     pass
 
 
+def get_mayjor_contract(
+    tick_df: pl.DataFrame, last_mayjor_contract: str
+) -> pl.DataFrame:
+    """
+    获取主力合约tick数据
+    """
+    major_tick_df = pl.DataFrame(schema=tick_df.schema)
+    mayjor_contract = last_mayjor_contract
+    timp_gro = tick_df.group_by("datetime")
+    for time, df in timp_gro:
+        if len(df) > 1:
+            df = df.sort("position", reverse=True)
+            max_contract = df["symbol_id"][0]
+            if max_contract == "" or get_term(max_contract) >= get_term(
+                mayjor_contract
+            ):
+                mayjor_contract = max_contract
+            major_tick_df.extend(df.head(1))
+        else:
+            pass
+
+
 def get_nearest_hour(dt):
     """
     get the nearest hour of the given datetime object
@@ -218,6 +243,51 @@ def get_nearest_hour(dt):
     nearest_hour = dt.replace(hour=hour % 24, minute=0, second=0, microsecond=0)
 
     return nearest_hour
+
+
+def group_by_product(df: pl.DataFrame):
+    """
+    按产品分组
+    """
+    df = df.with_columns(
+        pl.col("symbol_id").str.extract(r"(^[a-zA-Z]+)", 1).alias("pro_part")
+    )
+    df = df.with_columns(
+        pl.col("symbol_id").str.extract(r"([A-Z]+)$", 1).alias("exchange")
+    )
+    product_gro = df.group_by("pro_part")
+    return product_gro
+
+
+@timeit
+def execute_1d_extract():
+    condition = "where match(symbol_id,'^[a-zA-Z]+\\d+.CZCE$') and symbol_id not like '%8888%' and symbol_id not like '%9999%';"
+    df = get_1d_dat(condition)
+    product_gro = group_by_product(df)
+    logg = setup_logger("day", "1d_extract.log")
+    for pro, dat in product_gro:
+        exchange = dat["exchange"][0]
+        dat = dat.drop("pro_part")
+        dat = dat.sort("datetime")
+        save_1d_dat(dat, pro[0], exchange)
+        logg.info(f"Saved {pro[0]} of {exchange} data to future_1d.db successfully")
+
+
+@timeit
+def save_db(
+    df: pl.DataFrame | pd.DataFrame,
+    product_id: str,
+    date: str = "all",
+    db_name: str = "future_index",
+):
+    """
+    保存数据到sqlite数据库
+    """
+    conn = get_db_conn(db_name)
+    if isinstance(df, pl.DataFrame):
+        df = df.to_pandas()
+    df.to_sql(product_id, conn, if_exists="append", index=False)
+    Logger.info(f"saved {product_id} of {date} data to {db_name} successfully")
 
 
 @timeit
@@ -247,7 +317,7 @@ def creat_snapshot_array(length: int, columns: int) -> np.ndarray:
 
 @timeit
 def get_last_snapshot(
-    symbol_ids: list,
+    symbol_ids: np.ndarray,
     date: str = "2024-07-19",
     fields: str = "symbol_id,datetime,current,position",
 ) -> np.ndarray:
@@ -257,11 +327,11 @@ def get_last_snapshot(
     """
     conn = get_conn()
     start_datetime = " ".join([date, "15:00:00"])
-    end_datetime = " ".join([date, "21:00:00"])
+    end_datetime = " ".join([date, "16:00:00"])
     snapshot = creat_snapshot_array(len(symbol_ids), len(fields.split(",")) - 2)
     idx = 0
     for symbol_id in symbol_ids:
-        sql = f"select {fields} from jq.`tick` where datetime between '{start_datetime}' and  '{end_datetime}' and symbol_id = '{symbol_id}' order by datetime desc limit 1"
+        sql = f"select {fields} from jq.`tick` where datetime between '{start_datetime}' and  '{end_datetime}' and symbol_id = '{symbol_id}' order by datetime asc limit 1"
         row = conn.execute(sql)
         if not row:
             idx += 1
@@ -269,6 +339,52 @@ def get_last_snapshot(
         snapshot[idx] = np.array(row[0][2:], dtype=np.float64)
         idx += 1
     return snapshot
+
+
+@timeit
+def get_symbols_tick(
+    symbols: list,
+    date: str = "2024-07-19",
+    fields: str = "symbol_id,datetime,current,a1_v,a1_p,b1_v,b1_p,position",
+):
+    """
+    获取指定若干合约的Tick数据
+    """
+    conn = get_conn()
+    start_datetime = " ".join([get_last_trading_day(date), "20:55:00"])
+    end_datetime = " ".join([date, "16:00:00"])
+    sql = f"select {fields} from jq.`tick` where datetime between '{start_datetime}' and  '{end_datetime}' and symbol_id in {tuple(symbols)};"
+    rows = conn.execute(sql, columnar=True, with_column_types=True)
+    df = pl.DataFrame(
+        rows[0],
+        schema=fields.split(","),
+        orient="col",
+    )
+    return df
+
+
+def get_1d_dat(condition: str = ""):
+    """
+    获取日线数据
+    """
+    conn = get_conn()
+    fields = "symbol_id,datetime"
+    sql = f"select {fields} from jq.`1d` {condition}"
+    rows = conn.execute(sql, columnar=True)
+    df = pl.DataFrame(rows, schema=fields.split(","))
+    return df
+
+
+def save_1d_dat(df: pl.DataFrame, product: str, exchange: str):
+    """
+    保存日线数据到sqlite数据库
+    """
+    conn = sqlite3.connect("C:\\用户\\newf4\\database\\future_1d.db")
+    cur = conn.cursor()
+    pandas_df = df.to_pandas()
+    pandas_df["datetime"] = pandas_df["datetime"].astype("datetime64[us]")
+    pandas_df.to_sql(f"{product}_{exchange}", conn, if_exists="append", index=False)
+    conn.close()
 
 
 if __name__ == "__main__":
