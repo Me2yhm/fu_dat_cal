@@ -1,9 +1,7 @@
-import clickhouse_driver
 import polars as pl
 import pandas as pd
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
-from threading import Lock
 from loguru import logger
 
 from numba import njit, types
@@ -19,26 +17,25 @@ from utils import DBHelper as db
 
 
 class Processer:
+    max_workers = 3
 
-    @staticmethod
-    def process_major_contract():
+    @classmethod
+    def process_major_contract(cls):
         """
         计算主力合约
         """
         prodct_dct = db.get_product_dict()
         results = []
-        with ThreadPoolExecutor() as executor:
-            futures = []
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = {}
             for product, exchange in prodct_dct.items():
-                futures.append(
-                    (
-                        product,
-                        executor.submit(
-                            Processer.process_single_mayjor_contract, product, exchange
-                        ),
+                futures[
+                    executor.submit(
+                        cls.process_single_mayjor_contract, product, exchange
                     )
-                )
-            for product, future in as_completed(futures):
+                ] = product
+            for future in as_completed(futures):
+                product = futures[future]
                 try:
                     major_contract = future.result()
                     if major_contract is not None:
@@ -64,17 +61,24 @@ class Processer:
         values = creat_value_array(snap_shots.shape[1] + 4)
         value_index = 0
         last_datetime = tick_data[0][1]  # datetime 精度为10ms
+        last_datetime_intrade = True
         high = low = 0
         # 循环之前几乎占据一般的时间，需要优化
         for row in tick_data:
             timestamp = row[1] / 1e3  # 转化为秒
             hms = get_hms(timestamp)
             if not in_trade_times(product_comma, hms):
-                # print(timestamp, "||||", hms, "not in trade times")
+                last_datetime = row[1]
+                last_datetime_intrade = False
+                print(timestamp, "||||", hms, "not in trade times")
                 continue
             symbol_idx = row[0]
             new_datetime = row[1]
             if new_datetime != last_datetime:
+                if not last_datetime_intrade:
+                    last_datetime = new_datetime
+                    last_datetime_intrade = True
+                    continue
                 value, high, low = cal_value(snap_shots, last_datetime, high, low)
                 values[value_index] = value
                 value_index += 1
@@ -85,6 +89,7 @@ class Processer:
                 row["a1_p"],
                 row["b1_v"],
                 row["b1_p"],
+                row["volume"],
                 row["position"],
             ]  # symbol_idx会不会有缺失值？
 
@@ -132,7 +137,7 @@ class Processer:
         cls, values: np.ndarray, columns: list, product: str, exchange: str
     ) -> pd.DataFrame:
         """
-        指数数据后处理, 将symbol_id转化为字符串
+        指数数据后处理, 将symbol_id转化为字符串, timestamp转化为datetime64[ms]
         """
         index_df = pd.DataFrame(
             values,
@@ -146,7 +151,7 @@ class Processer:
     @classmethod
     @timeit
     def save_1d_index(
-        cls, date: str = "2024-07-19", product: str = "ag", exchange: str = "SHFE"
+        cls, product: str = "ag", exchange: str = "SHFE", date: str = "2024-07-19"
     ):
         """
         计算一个产品一天的指数数据
@@ -157,7 +162,7 @@ class Processer:
             Logger.warning(f"{symbol_id} of {date} data has been processed")
             return
         # 新合约的处理：空行填充
-        fields = "symbol_id,datetime,current,a1_v,a1_p,b1_v,b1_p,position"
+        fields = "symbol_id,datetime,current,a1_v,a1_p,b1_v,b1_p,volume,position"
         symbol_ids = db.get_all_contracts(product, exchange, date)
         tick_data = db.get_symbols_tick(symbol_ids, date, fields).sort(
             by="datetime"
@@ -172,62 +177,61 @@ class Processer:
         values = Processer.execute_single_pro(snap_shots, struct_arr, product_comma)
         columns = fields.split(",") + ["high", "low"]
         index_df = cls.index_dat_postprocess(values, columns, product, exchange)
-        print(index_df.tail())
-        # save_db(index_df, product, date)
+        print(index_df.head())
+        # db.save_db(index_df, tick, date)
         # db.insert_records(record)
         # return f"{symbol_id}-{date}"
 
     @classmethod
     def process_single_index_product(cls, product: str, exchange: str):
         """
-        处理单个产品
+        处理单个产品的指数数据
         """
         date_lst = db.get_pro_dates(product, exchange)
         results = []
-        with ThreadPoolExecutor() as executor:
-            futures = []
-            for date in date_lst:
-                futures.append(
-                    (date, executor.submit(cls.save_1d_index, date, product, exchange))
+        with ThreadPoolExecutor(max_workers=cls.max_workers) as executor:
+            futures = {}
+            for date in date_lst[1:]:
+                futures[executor.submit(cls.save_1d_index, product, exchange, date)] = (
+                    date
                 )
-            for date, future in as_completed(futures):
+
+            for future in as_completed(futures):
                 try:
                     result = future.result()
+                    date = futures[future]
                     if result:
                         results.append(result)
                 except Exception as e:
                     logger.error(
-                        f"[{e.__class__.__name__}] Thread Error: {product} {exchange} {date}: {e}"
+                        f"[{e.__class__.__name__}] Thread Error: {product}_{exchange}_{date}: {e}"
                     )
         return results, product
 
-    @staticmethod
+    @classmethod
     @timeit
-    def cal_future_index():
+    def cal_future_index(cls):
         """
         计算期货指数主函数
         """
         prodct_dct = db.get_product_dict()
         results = {}
-        with ProcessPoolExecutor() as executor:
-            futures = [
-                (
-                    product,
-                    executor.submit(
-                        Processer.process_single_index_product, product, exchange
-                    ),
-                )
+        with ThreadPoolExecutor(max_workers=cls.max_workers) as executor:
+            futures = {
+                executor.submit(
+                    cls.process_single_index_product, product, exchange
+                ): product
                 for product, exchange in prodct_dct.items()
-            ]
-            for product, future in as_completed(futures):
+            }
+            for future in as_completed(futures):
                 try:
-                    result, pro = future.result()
+                    pro = futures[future]
+                    result = future.result()
                     if result:
                         results[pro] = result
+                        logger.success(f"{pro} have been processed successfully")
                 except Exception as e:
-                    logger.error(
-                        f"[{e.__class__.__name__}] Processe Error {product}: {e}"
-                    )
+                    logger.error(f"[{e.__class__.__name__}] Processe Error {pro}: {e}")
         return results
 
     @classmethod
@@ -242,7 +246,10 @@ class Processer:
             return
         secondery = db.get_secondery_id(product, exchange, date)
         secondery_df = db.get_symbols_tick([secondery], date, "*").sort(by="datetime")
-        return secondery_df
+        secondery_df = cls.secondery_dat_postprocess(secondery_df, symbol_id)
+        db.save_db(secondery_df, "tick", date)
+        db.insert_records(record)
+        return date
 
     @classmethod
     def process_single_secondery_product(cls, product: str, exchange: str):
@@ -250,26 +257,23 @@ class Processer:
         存一个期货品种的次主连数据
         """
         date_lst = db.get_pro_dates(product, exchange)
-        results = []
-        with ThreadPoolExecutor() as executor:
+        processed_dates = []
+        with ThreadPoolExecutor(max_workers=cls.max_workers) as executor:
             futures = []
             for date in date_lst:
                 futures.append(
-                    (
-                        date,
-                        executor.submit(cls.save_1d_secondery, product, exchange, date),
-                    )
+                    executor.submit(cls.save_1d_secondery, product, exchange, date)
                 )
-            for date, future in as_completed(futures):
+            for future in as_completed(futures):
                 try:
-                    result = future.result()
-                    if result:
-                        results.append(result)
+                    processed_date = future.result()
+                    if processed_date:
+                        processed_dates.append(processed_date)
                 except Exception as e:
                     logger.error(
-                        f"[{e.__class__.__name__}] Thread Error: {product} {exchange} {date}: {e}"
+                        f"[{e.__class__.__name__}] Thread Error: {product} {exchange} {processed_date}: {e}"
                     )
-        return results, product
+        return processed_dates, product
 
     @staticmethod
     def process_secondery_contract():
@@ -277,25 +281,40 @@ class Processer:
         计算期货次主连合约
         """
         prodct_dct = db.get_product_dict()
+        results = {}
         with ProcessPoolExecutor() as executor:
-            futures = [
-                (
-                    product,
-                    executor.submit(
-                        Processer.process_single_secondery_product, product, exchange
-                    ),
-                )
+            futures = {
+                executor.submit(
+                    Processer.process_single_secondery_product, product, exchange
+                ): product
                 for product, exchange in prodct_dct.items()
-            ]
-            for product, future in as_completed(futures):
+            }
+            for future in as_completed(futures):
                 try:
-                    result, pro = future.result()
-                    if result:
-                        logger.info(result)
+                    processed_dates = future.result()
+                    product = futures[future]
+                    if processed_dates:
+                        results[product] = processed_dates
+                        logger.success(
+                            f"{product} secondery contracts have been processed successfully"
+                        )
                 except Exception as e:
                     logger.error(
                         f"[{e.__class__.__name__}] Processe Error {product}: {e}"
                     )
+            return results
+
+    @classmethod
+    def secondery_dat_postprocess(
+        cls, secondery_dat: pl.DataFrame, symbol_id: str
+    ) -> pd.DataFrame:
+        """
+        期货次主连数据后处理
+        """
+        secondery_dat = secondery_dat.with_columns(
+            pl.lit(symbol_id).alias("symbol_id")
+        ).sort("datetime")
+        return secondery_dat
 
     @classmethod
     def process_single_mayjor_contract(cls, product: str, exchange: str):
@@ -307,8 +326,14 @@ class Processer:
         if db.is_processed(record):
             Logger.warning(f"{symbol_id} of all data has been processed")
             return
+        logger.info(f"Processing {symbol_id}")
         major_contract = db.get_mayjor_contract_dat(product, exchange)
-        return major_contract
+        if major_contract:
+            major_contract = cls.mayjor_dat_postprocess(major_contract, symbol_id)
+            db.save_db(major_contract, "tick", "all")
+            db.insert_records(record)
+            logger.success(f"{symbol_id} have been processed successfully")
+        return symbol_id
 
     @classmethod
     def mayjor_dat_postprocess(
@@ -324,12 +349,12 @@ class Processer:
 
 
 @njit()
-def creat_value_array(columns: int) -> np.ndarray:
+def creat_value_array(columns: int, dtype=np.float64) -> np.ndarray:
     """
     创建index值数组
     """
     # 注意value数组的columns和snapshot数组的columns不一致
-    return np.zeros((100000, columns), dtype=np.float64)
+    return np.zeros((100000, columns), dtype=dtype)
 
 
 @njit()
@@ -338,19 +363,27 @@ def cal_value(snapshot: np.ndarray, datetime: float, high: float, low: float):
     根据snapshot计算指数value
     """
     value = np.zeros(snapshot.shape[1] + 4)
-    value[1] = datetime
     position = snapshot[:, -1]
-    value[2:-2] = (position @ snapshot) / np.sum(position)
+    if (position == 0).all():
+        return value, high, low
+    total_position = position.sum()
+
+    value[2:-4] = (position @ snapshot[:, :-2]) / total_position
     current = value[2]
     if current >= high or high == 0:
         high = current
     if current <= low or low == 0:
         low = current
+
+    value[1] = datetime
+    value[-4] = snapshot[:, -2].sum()
+    value[-3] = total_position
     value[-2] = high
     value[-1] = low
     return value, high, low
 
 
 if __name__ == "__main__":
-    Processer.save_1d_index("2024-07-19", "ag", "SHFE")
-    Processer.save_1d_index("2024-07-19", "ag", "SHFE")
+    results = Processer.process_major_contract()
+    breakpoint()
+    # Processer.save_1d_index("ag", "SHFE", "2012-05-11")

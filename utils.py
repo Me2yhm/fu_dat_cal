@@ -18,6 +18,8 @@ import pymongo
 import pymongo.collection
 
 from logger import Logger, setup_logger
+from jy_lib.clickhouse import ClickHouse
+from loguru import logger
 
 log_root_dir = Path(__file__).parent / "log"
 
@@ -29,7 +31,9 @@ def timeit(func):
         result = func(*args, **kwargs)  # 调用被装饰的函数
         end_time = time.time()  # 记录结束时间
         elapsed_time = end_time - start_time  # 计算运行时间
-        print(f"Function '{func.__name__}' executed in {elapsed_time:.4f} seconds")
+        logger.info(
+            f"Function '{func.__name__}' executed in {elapsed_time:.4f} seconds"
+        )
         return result  # 返回函数的结果
 
     return wrapper
@@ -38,7 +42,7 @@ def timeit(func):
 class DBHelper:
     lock = threading.Lock()
     # clickhouse
-    reader_uri = "clickhouse://reader:d9f6ed24@172.16.7.30:9900/jq?compression=lz4&use_numpy=true"
+    reader_uri = "clickhouse://reader:d9f6ed24@172.16.6.30:9900/jq?compression=lz4&use_numpy=true"
     conn_reader = clickhouse_driver.Client.from_url(url=reader_uri)
     # 本地数据库reader，调试用
     reader_1d_uri = "C:\\用户\\newf4\\database\\future_1d.db"
@@ -123,7 +127,6 @@ class DBHelper:
         """
         with cls.lock:
             rows = cls.conn_reader.execute(sql, columnar=True)
-            print(rows)
         return rows[0][1]
 
     @classmethod
@@ -132,7 +135,7 @@ class DBHelper:
         cls,
         symbol_ids: np.ndarray,
         date: str = "2024-07-19",
-        fields: str = "symbol_id,datetime,current,a1_v,a1_p,b1_v,b1_p,position",
+        fields: str = "symbol_id,datetime,current,a1_v,a1_p,b1_v,b1_p,volume,position",
     ) -> np.ndarray:
         """
         获取上一个快照数据
@@ -164,7 +167,7 @@ class DBHelper:
         cls,
         symbols: list,
         date: str = "2024-07-19",
-        fields: str = "symbol_id,datetime,current,a1_v,a1_p,b1_v,b1_p,position",
+        fields: str = "symbol_id,datetime,current,a1_v,a1_p,b1_v,b1_p,volume,position",
     ):
         """
         获取指定若干合约的Tick数据
@@ -233,11 +236,10 @@ class DBHelper:
         return last_trading_day
 
     @classmethod
-    @timeit
     def save_db(
         cls,
         df: pl.DataFrame | pd.DataFrame,
-        product_id: str,
+        table: str,
         date: str = "all",
         db_name: str = "future_index",
     ):
@@ -247,8 +249,8 @@ class DBHelper:
         if isinstance(df, pl.DataFrame):
             df = df.to_pandas()
         with cls.lock:
-            df.to_sql(product_id, cls.writer_conn, if_exists="append", index=False)
-        Logger.info(f"saved {product_id} of {date} data to {db_name} successfully")
+            df.to_sql(table, cls.writer_conn, if_exists="append", index=False)
+        Logger.info(f"saved {table} of {date} data to {db_name} successfully")
 
     @classmethod
     @timeit
@@ -403,7 +405,7 @@ def creat_snapshot_array(length: int, columns: int) -> np.ndarray:
     return np.zeros((length, columns), dtype=np.float64)
 
 
-@numba.njit(nopython=True)
+@numba.njit()
 def get_product_comma(product: str) -> str:
     """
     获取大写品种代码并添加逗号
@@ -411,7 +413,7 @@ def get_product_comma(product: str) -> str:
     return f"{product.upper()},"
 
 
-@numba.njit(nopython=True)
+@numba.njit()
 def get_hms(seconds):
     """将timestamp转换为hms"""
     seconds = divmod(seconds, 86_400)[1]
@@ -420,7 +422,7 @@ def get_hms(seconds):
     return h * 10_000 + m * 100 + s
 
 
-@numba.njit(nopython=True)
+@numba.njit()
 def in_trade_times(product_comma: str, hms: int) -> bool:
     """判断是否在交易时间"""
     if product_comma in "IM,IH,IC,IF,":
@@ -448,9 +450,6 @@ def in_trade_times(product_comma: str, hms: int) -> bool:
 
 
 if __name__ == "__main__":
-    symbol_ids = DBHelper.get_all_contracts("ag", "SHFE", "2012-05-10")
-    dic = DBHelper.get_last_snapshot(
-        symbol_ids,
-        "2012-05-09",
-    )
-    print(dic)
+    db = DBHelper
+    for rec in db.record_conn.find():
+        print(rec)
