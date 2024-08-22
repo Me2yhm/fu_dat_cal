@@ -1,10 +1,11 @@
 from datetime import datetime, timedelta
 import functools
-import json
+import os
 from pathlib import Path
 import re
 import sqlite3
 import time
+from typing import Literal
 
 import numba
 import pandas as pd
@@ -22,6 +23,14 @@ from jy_lib.clickhouse import ClickHouse
 from loguru import logger
 
 log_root_dir = Path(__file__).parent / "log"
+temp_dir = Path(__file__).parent / "temp"
+
+
+def create_1d_dbfile():
+    temp_dir.mkdir(exist_ok=True)
+    db_file = temp_dir / "future_1d.db"
+    if not db_file.exists():
+        db_file.touch()
 
 
 def timeit(func):
@@ -42,21 +51,206 @@ def timeit(func):
 class DBHelper:
     lock = threading.Lock()
     # clickhouse
-    reader_uri = "clickhouse://reader:d9f6ed24@172.16.6.30:9900/jq?compression=lz4&use_numpy=true"
+    reader_uri = "clickhouse://reader:d9f6ed24@172.16.7.30:9900/jq?compression=lz4&use_numpy=true"
     conn_reader = clickhouse_driver.Client.from_url(url=reader_uri)
     # 本地数据库reader，调试用
-    reader_1d_uri = "C:\\用户\\newf4\\database\\future_1d.db"
-    conn_1d = sqlite3.connect(reader_1d_uri)
+    reader_1d_uri = temp_dir / "future_1d.db"
+    try:
+        conn_1d = sqlite3.connect(reader_1d_uri, check_same_thread=False)
+    except sqlite3.OperationalError:
+        create_1d_dbfile()
+        conn_1d = sqlite3.connect(reader_1d_uri, check_same_thread=False)
     cursor_1d = conn_1d.cursor()
     # 本地数据库writer，调试用
-    writer_uri = "C:\\用户\\newf4\\database\\future_index.db"
-    writer_conn = sqlite3.connect(writer_uri)
-    writer_cursor = writer_conn.cursor()
+    writer_uri = "clickhouse://writer:echobest4@localhost:9000/default"
+    writer_conn = ClickHouse(writer_uri, 8123)
 
     logger = setup_logger("DBHelper", "db_helper.log")
 
     mongodb_url = "mongodb://quote_rw:rx5cb0g3myoiw30g@172.16.7.31:27027/Quote"
     record_conn = pymongo.MongoClient(mongodb_url)["Quote"]["FutureIndex"]
+    columns_type_dict = {
+        "symbol_id": str,
+        "datetime": str,
+        "current": float,
+        "a1_v": float,
+        "a1_p": float,
+        "b1_v": float,
+        "b1_p": float,
+        "volume": float,
+        "position": float,
+    }
+
+    @classmethod
+    def init_writer_table(cls, table_name: Literal["tick", "1d", "1m"]):
+        """
+        创建clickhouse表, 用于写入数据
+        """
+        collection = "default"
+        if table_name == "tick":
+            sql = f"""
+            CREATE TABLE IF NOT EXISTS {collection}.tick
+            (
+
+                `symbol_id` String CODEC(ZSTD(3)),
+
+                `datetime` DateTime64(3) CODEC(DoubleDelta,
+            ZSTD(3)),
+
+                `current` Nullable(Float64) CODEC(ZSTD(3)),
+
+                `high` Nullable(Float64) CODEC(ZSTD(3)),
+
+                `low` Nullable(Float64) CODEC(ZSTD(3)),
+
+                `volume` Nullable(Int64) CODEC(ZSTD(3)),
+
+                `money` Nullable(Float64) CODEC(ZSTD(3)),
+
+                `position` Nullable(Int64) CODEC(ZSTD(3)),
+
+                `a5_v` Nullable(Int64) CODEC(ZSTD(3)),
+
+                `a5_p` Nullable(Float64) CODEC(ZSTD(3)),
+
+                `a4_v` Nullable(Int64) CODEC(ZSTD(3)),
+
+                `a4_p` Nullable(Float64) CODEC(ZSTD(3)),
+
+                `a3_v` Nullable(Int64) CODEC(ZSTD(3)),
+
+                `a3_p` Nullable(Float64) CODEC(ZSTD(3)),
+
+                `a2_v` Nullable(Int64) CODEC(ZSTD(3)),
+
+                `a2_p` Nullable(Float64) CODEC(ZSTD(3)),
+
+                `a1_v` Nullable(Int64) CODEC(ZSTD(3)),
+
+                `a1_p` Nullable(Float64) CODEC(ZSTD(3)),
+
+                `b1_v` Nullable(Int64) CODEC(ZSTD(3)),
+
+                `b1_p` Nullable(Float64) CODEC(ZSTD(3)),
+
+                `b2_v` Nullable(Int64) CODEC(ZSTD(3)),
+
+                `b2_p` Nullable(Float64) CODEC(ZSTD(3)),
+
+                `b3_v` Nullable(Int64) CODEC(ZSTD(3)),
+
+                `b3_p` Nullable(Float64) CODEC(ZSTD(3)),
+
+                `b4_v` Nullable(Int64) CODEC(ZSTD(3)),
+
+                `b4_p` Nullable(Float64) CODEC(ZSTD(3)),
+
+                `b5_v` Nullable(Int64) CODEC(ZSTD(3)),
+
+                `b5_p` Nullable(Float64) CODEC(ZSTD(3))
+            )
+            ENGINE = ReplacingMergeTree
+            PARTITION BY sipHash64(symbol_id) % 256
+            PRIMARY KEY (symbol_id,
+            datetime)
+            ORDER BY (symbol_id,
+            datetime)
+            SETTINGS index_granularity = 8192;
+            """
+        elif table_name == "1d":
+            sql = f"""
+                CREATE TABLE IF NOT EXISTS {collection}.`1d`
+                (
+
+                    `symbol_id` String CODEC(ZSTD(3)),
+
+                    `datetime` DateTime64(3) CODEC(DoubleDelta,
+                ZSTD(3)),
+
+                    `open` Nullable(Float64) CODEC(ZSTD(3)),
+
+                    `high` Nullable(Float64) CODEC(ZSTD(3)),
+
+                    `low` Nullable(Float64) CODEC(ZSTD(3)),
+
+                    `close` Nullable(Float64) CODEC(ZSTD(3)),
+
+                    `volume` Nullable(Int64) CODEC(ZSTD(3)),
+
+                    `money` Nullable(Float64) CODEC(ZSTD(3)),
+
+                    `factor` Nullable(Float64) CODEC(ZSTD(3)),
+
+                    `high_limit` Nullable(Float64) CODEC(ZSTD(3)),
+
+                    `low_limit` Nullable(Float64) CODEC(ZSTD(3)),
+
+                    `avg` Nullable(Float64) CODEC(ZSTD(3)),
+
+                    `pre_close` Nullable(Float64) CODEC(ZSTD(3)),
+
+                    `paused` Nullable(UInt8) DEFAULT 0 CODEC(ZSTD(3)),
+
+                    `open_interest` Nullable(Int64) CODEC(ZSTD(3))
+                )
+                ENGINE = ReplacingMergeTree
+                PARTITION BY sipHash64(symbol_id) % 256
+                PRIMARY KEY (symbol_id,
+                datetime)
+                ORDER BY (symbol_id,
+                datetime)
+                SETTINGS index_granularity = 8192;
+            """
+        elif table_name == "1m":
+            sql = f"""
+                CREATE TABLE IF NOT EXISTS {collection}.`1m`
+                (
+
+                    `symbol_id` String CODEC(ZSTD(3)),
+
+                    `datetime` DateTime64(3) CODEC(DoubleDelta,
+                ZSTD(3)),
+
+                    `open` Nullable(Float64) CODEC(ZSTD(3)),
+
+                    `high` Nullable(Float64) CODEC(ZSTD(3)),
+
+                    `low` Nullable(Float64) CODEC(ZSTD(3)),
+
+                    `close` Nullable(Float64) CODEC(ZSTD(3)),
+
+                    `volume` Nullable(Int64) CODEC(ZSTD(3)),
+
+                    `money` Nullable(Float64) CODEC(ZSTD(3)),
+
+                    `factor` Nullable(Float64) CODEC(ZSTD(3)),
+
+                    `high_limit` Nullable(Float64) CODEC(ZSTD(3)),
+
+                    `low_limit` Nullable(Float64) CODEC(ZSTD(3)),
+
+                    `avg` Nullable(Float64) CODEC(ZSTD(3)),
+
+                    `pre_close` Nullable(Float64) CODEC(ZSTD(3)),
+
+                    `paused` Nullable(UInt8) DEFAULT 0 CODEC(ZSTD(3)),
+
+                    `open_interest` Nullable(Int64) CODEC(ZSTD(3))
+                )
+                ENGINE = ReplacingMergeTree
+                PARTITION BY sipHash64(symbol_id) % 256
+                PRIMARY KEY (symbol_id,
+                datetime)
+                ORDER BY (symbol_id,
+                datetime)
+                SETTINGS index_granularity = 8192;
+            """
+        cls.writer_conn.execute(sql)
+
+    @classmethod
+    def clear_writer_table(cls, table: Literal["1d", "1m", "tick"]):
+        clear_sql = f" truncate table default.`{table}`"
+        cls.writer_conn.execute(clear_sql)
 
     @classmethod
     @timeit
@@ -95,17 +289,21 @@ class DBHelper:
         sql = f"""
                 SELECT symbol_id 
                 FROM jq.`1d`
-                WHERE money IN (
-                    SELECT money 
+                WHERE (money,avg) in (
+                    SELECT money,avg 
                     FROM jq.`1d` d 
                     WHERE symbol_id = '{product}9999.{exchange}'
+                    AND `datetime` = '{date} 00:00:00'
                 )
                 AND `datetime` = '{date} 00:00:00'
-                AND symbol_id != '{product}9999.{exchange}';
+                AND symbol_id LIKE '%.{exchange}%'
+                AND symbol_id != '{product}9999.{exchange}'
+                AND symbol_id != '{product}8888.{exchange}';
         """
         with cls.lock:
             rows = cls.conn_reader.execute(sql, columnar=True)
-        assert len(rows) == 1, "主力合约数量不唯一"
+        assert rows, "没有主力合约数据"
+        assert len(rows[0]) == 1, "主力合约数量不唯一"
         major_contract = rows[0][0]
         return major_contract
 
@@ -116,17 +314,24 @@ class DBHelper:
         注意中金所主力合约的规则不一样
         同花顺规则也不一样（ag,2024-07-22）
         """
+        symbol_id = (
+            f"{product}___.{exchange}"
+            if exchange == "SHFE"
+            else f"{product}____.{exchange}"
+        )
         sql = f"""
                 SELECT symbol_id 
                 FROM jq.`1d`
                 WHERE `datetime` = '{date} 00:00:00'
-                AND symbol_id LIKE '{product}____.{exchange.upper()}'
+                AND symbol_id LIKE '{symbol_id}'
                 AND symbol_id != '{product}8888.{exchange}'
                 AND symbol_id != '{product}9999.{exchange}'
                 ORDER BY open_interest DESC limit 2;
         """
         with cls.lock:
             rows = cls.conn_reader.execute(sql, columnar=True)
+        assert rows, "没有次主力合约数据"
+        assert len(rows[0]) == 2, f"次主力合约数量不确定, 仅包含{len(rows[0])}个"
         return rows[0][1]
 
     @classmethod
@@ -142,7 +347,7 @@ class DBHelper:
         date 需要为交易日。
         """
         start_datetime = " ".join([date, "15:00:00"])
-        end_datetime = " ".join([date, "16:00:00"])
+        end_datetime = " ".join([date, "15:01:00"])
         snapshot = creat_snapshot_array(len(symbol_ids), len(fields.split(",")) - 2)
         idx = 0
         with cls.lock:
@@ -173,10 +378,13 @@ class DBHelper:
         获取指定若干合约的Tick数据
         """
         start_datetime = " ".join([cls.get_last_trading_day(date), "20:55:00"])
-        end_datetime = " ".join([date, "16:00:00"])
+        end_datetime = " ".join([date, "15:01:00"])
         sql = f"select {fields} from jq.`tick` where datetime between '{start_datetime}' and  '{end_datetime}' and symbol_id in {tuple(symbols)};"
         with cls.lock:
             rows = cls.conn_reader.execute(sql, columnar=True)
+        if not rows:
+            logger.warning(f"No data found for {symbols} on {date}")
+            raise AssertionError
         if fields == "*":
             columns_info = cls.conn_reader.execute("DESCRIBE TABLE jq.`tick`")
             schemas = [column[0] for column in columns_info]
@@ -188,6 +396,7 @@ class DBHelper:
         return df
 
     @classmethod
+    @timeit
     def get_1d_dat(cls, condition: str = ""):
         """
         获取日线数据
@@ -218,12 +427,36 @@ class DBHelper:
     @classmethod
     def get_pro_dates(cls, product: str, exchange: str) -> list:
         """
-        获取指定品种的交易日列表
+        获取指定品种的交易日列表, 以日线交易日列表为基准
         """
-        query = f"SELECT distinct Date(datetime) as date FROM {product}_{exchange} order by datetime asc"
+        query_1d = f"SELECT distinct Date(datetime) as date FROM {product}_{exchange} order by datetime asc"
         with cls.lock:
-            df = pd.read_sql(query, cls.conn_1d, columns=["datetime"])
-        return df["date"].tolist()
+            df = pd.read_sql(query_1d, cls.conn_1d, columns=["datetime"])
+        date = df["date"].tolist()
+        symbol_id = (
+            f"{product}___.{exchange}"
+            if exchange == "CZCE"
+            else f"{product}____.{exchange}"
+        )
+        query_tick_start = f"SELECT Date(datetime) as date FROM jq.tick where symbol_id like '{symbol_id}' and toDate(datetime) >= '{date[0]}' order by datetime asc limit 1"
+        query_tick_end = f"SELECT Date(datetime) as date FROM jq.tick where symbol_id like '{symbol_id}' and toDate(datetime) <= '{date[-1]}' order by datetime desc limit 1"
+        with cls.lock:
+            try:
+                start_date = str(cls.conn_reader.execute(query_tick_start)[0][0])
+                end_date = str(cls.conn_reader.execute(query_tick_end)[0][0])
+            except IndexError:
+                logger.error(f"No data found for {product} of {exchange}")
+                raise AssertionError
+        try:
+            start_index = date.index(start_date)
+        except ValueError:
+            start_index = 0
+        try:
+            end_index = date.index(end_date) if end_date != date[-1] else len(date)
+        except ValueError:
+            end_index = len(date)
+        date = date[start_index:end_index]
+        return date
 
     @classmethod
     def get_last_trading_day(cls, date: str) -> str:
@@ -238,19 +471,19 @@ class DBHelper:
     @classmethod
     def save_db(
         cls,
+        symbol_id: str,
         df: pl.DataFrame | pd.DataFrame,
-        table: str,
+        table: Literal["tick", "1d", "1m"],
         date: str = "all",
-        db_name: str = "future_index",
     ):
         """
         保存数据到sqlite数据库
         """
-        if isinstance(df, pl.DataFrame):
-            df = df.to_pandas()
+        if isinstance(df, pd.DataFrame):
+            df = pl.from_pandas(df)
         with cls.lock:
-            df.to_sql(table, cls.writer_conn, if_exists="append", index=False)
-        Logger.info(f"saved {table} of {date} data to {db_name} successfully")
+            cls.writer_conn.import_df(table, df, ("symbol_id", "datetime"))
+        logger.info(f"saved {symbol_id} of {date} data to {table} successfully")
 
     @classmethod
     @timeit
@@ -288,6 +521,7 @@ class DBHelper:
         return is_processed
 
     @classmethod
+    @timeit
     def group_by_product(cls, df: pl.DataFrame):
         """
         按产品分组
@@ -301,19 +535,28 @@ class DBHelper:
         product_gro = df.group_by("pro_part")
         return product_gro
 
+    @staticmethod
+    def delete_1d_dbfile():
+        global temp_dir
+        db_file = temp_dir / "future_1d.db"
+        if db_file.exists():
+            db_file.unlink()
+
     @classmethod
     @timeit
     def execute_1d_extract(cls):
-        condition = "where match(symbol_id,'^[a-zA-Z]+\\d+.[a-zA-Z]+$') and symbol_id not like '%8888%' and symbol_id not like '%9999%';"
+        """
+        提取日线数据的symbl_id, datetime字段, 并按照产品分组, 保存到sqlite临时数据库
+        """
+        condition = "where match(symbol_id,'^[a-zA-Z]+\\d+.[a-zA-Z]+$') and symbol_id not like '%8888%' and symbol_id not like '%9999%' and paused = 0;"
         df = cls.get_1d_dat(condition)
         product_gro = cls.group_by_product(df)
         logg = setup_logger("day", "1d_extract.log")
         for pro, dat in product_gro:
             record = {"product": pro[0], "date": "all", "type": "day"}
-            with cls.lock:
-                if cls.is_processed(record):
-                    logg.warning(f"{pro[0]} of {dat['exchange'][0]} already processed")
-                    continue
+            if cls.is_processed(record):
+                logg.warning(f"{pro[0]} of {dat['exchange'][0]} already processed")
+                continue
             exchange = dat["exchange"][0]
             dat = dat.drop("pro_part")
             dat = dat.sort("datetime")
@@ -322,6 +565,7 @@ class DBHelper:
             logg.info(f"Saved {pro[0]} of {exchange} data to future_1d.db successfully")
 
     @classmethod
+    @timeit
     def save_1d_dat(cls, df: pl.DataFrame, product: str, exchange: str):
         """
         保存日线数据到sqlite数据库
@@ -342,6 +586,142 @@ class DBHelper:
             result = cls.record_conn.delete_many({})
             cls.logger.info(f"Deleted {result.deleted_count} records from database.")
             return result
+
+    @staticmethod
+    def get_1m_sql(symbol_id: str, date: str):
+        """
+        获取1分钟数据sql, date为交易日
+        """
+        last_date = DBHelper.get_last_trading_day(date)
+        sql = f"""
+            WITH
+                -- 获取前一日的收盘价
+                previous_close AS (
+                    SELECT close AS last_close
+                    FROM jq.`1d`
+                    WHERE symbol_id = '{symbol_id}' AND toDate(datetime) = '{last_date}'
+                    LIMIT 1
+                ),
+                
+                limits AS (
+                    SELECT 
+                        (settlement_price * 1.1) AS high_limit,
+                        (settlement_price * 0.9) AS low_limit
+                    FROM xt.`1d`
+                    WHERE symbol_id = 'ag2409.SHFE' AND toDate(datetime) = '{last_date}'
+                    LIMIT 1
+                ),
+
+                today_data AS (
+                SELECT *
+                FROM jq.tick t 
+                WHERE symbol_id = 'ag2409.SHFE'
+                    AND datetime BETWEEN '{last_date} 16:00:00' AND '{date} 15:02:00'
+                ),
+                
+                -- 获取集合竞价期间的数据
+                -- 节假日之前无夜盘，因此要求COUNT>0
+                auction_night AS (
+                    SELECT 
+                        parseDateTime('{last_date} 21:01:00', '%Y-%m-%d %H:%i:%s') AS minute,
+                        arrayFirst(x -> true, groupArray(current)) AS open, 
+                        arrayLast(x -> true, groupArray(high)) AS high, 
+                        arrayLast(x -> true, groupArray(low)) AS low,
+                        arrayLast(x -> true, groupArray(current)) AS close, 
+                        arrayLast(x -> true, groupArray(volume)) AS volume,
+                        arrayLast(x -> true, groupArray(money)) AS money,
+                        arrayLast(x -> true, groupArray(position)) AS open_interest
+                    FROM today_data
+                    WHERE datetime >= '{last_date} 20:59:00' AND datetime < '{last_date} 21:01:00'
+                    HAVING COUNT(*) > 0 
+                ),
+
+                -- 除了上期所外，其他交易所只有一次集合竞价
+                auction_day AS (
+                    SELECT 
+                        parseDateTime('{date} 09:01:00', '%Y-%m-%d %H:%i:%s') AS minute,
+                        arrayFirst(x -> true, groupArray(current)) AS open, 
+                        arrayLast(x -> true, groupArray(high)) AS high, 
+                        arrayLast(x -> true, groupArray(low)) AS low,
+                        arrayLast(x -> true, groupArray(current)) AS close, 
+                        arrayLast(x -> true, groupArray(volume)) AS volume,
+                        arrayLast(x -> true, groupArray(money)) AS money,
+                        arrayLast(x -> true, groupArray(position)) AS open_interest
+                    FROM today_data
+                    WHERE datetime >= '{date} 08:59:00' AND datetime < '{date} 09:01:00'
+                    HAVING COUNT(*) > 0
+                ),
+
+                -- 获取正常交易时段的数据
+                normal_data AS (
+                    SELECT 
+                        toStartOfMinute(datetime) + INTERVAL 1 MINUTE AS minute,
+                        arrayFirst(x -> true, groupArray(current)) AS open, 
+                        max(current) AS high, 
+                        min(current) AS low, 
+                        arrayLast(x -> true, groupArray(current)) AS close, 
+                        arrayLast(x -> true, groupArray(volume)) AS volume,
+                        arrayLast(x -> true, groupArray(money)) AS money,
+                        arrayLast(x -> true, groupArray(position)) AS open_interest
+                    FROM today_data
+                    WHERE symbol_id = 'ag2409.SHFE'
+                        AND datetime BETWEEN '{last_date} 21:01:00' AND '{date} 08:00:00'
+                        or datetime BETWEEN '{date} 09:01:00' AND '{date} 15:00:00'
+                    GROUP BY minute
+                ),
+
+                -- 处理集合竞价未成功的情况
+                combined_data AS (
+                    SELECT 
+                        *,
+                        row_number() OVER (ORDER BY minute) AS rn
+                    FROM (
+                        SELECT * FROM auction_day
+                        UNION ALL
+                        SELECT * FROM normal_data
+                        UNION ALL
+                        SELECT * FROM auction_night
+                    ) ORDER BY minute
+                ),
+                
+
+                diff AS (
+                    SELECT
+                        t1.*,
+                        t1.volume - t2.volume AS volume_diff,
+                        t1.money - t2.money AS money_diff,
+                        CASE 
+                            WHEN t2.rn = 0 THEN (SELECT last_close FROM previous_close)
+                            ELSE t2.close
+                        END
+                            AS pre_close
+                    FROM 
+                        combined_data t1
+                    LEFT JOIN 
+                        combined_data t2
+                    ON 
+                        t1.rn = t2.rn + 1
+                    )   
+                
+            -- 最终查询
+            SELECT 
+                '{symbol_id}' AS symbol_id,
+                minute as datetime,
+                open,
+                high,
+                low,
+                close,
+                volume_diff AS volume,
+                money_diff AS money,
+                pre_close,
+                (SELECT high_limit FROM limits) AS high_limit,
+                (SELECT low_limit FROM limits) AS low_limit,
+                open_interest
+            FROM diff
+            ORDER BY minute;
+
+        """
+        return sql
 
 
 def get_term(code: str) -> int:
@@ -450,6 +830,4 @@ def in_trade_times(product_comma: str, hms: int) -> bool:
 
 
 if __name__ == "__main__":
-    db = DBHelper
-    for rec in db.record_conn.find():
-        print(rec)
+    print(DBHelper.get_mayjor_contract_id("OI", "CZCE", "2012-07-17"))
