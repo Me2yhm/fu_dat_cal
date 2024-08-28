@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 import sqlite3
 import time
-from typing import Literal
+from typing import Literal, Union
 
 import numba
 import pandas as pd
@@ -289,8 +289,8 @@ class DBHelper:
         sql = f"""
                 SELECT symbol_id 
                 FROM jq.`1d`
-                WHERE (money,avg) in (
-                    SELECT money,avg 
+                WHERE (open_interest,avg) in (
+                    SELECT open_interest,avg 
                     FROM jq.`1d` d 
                     WHERE symbol_id = '{product}9999.{exchange}'
                     AND `datetime` = '{date} 00:00:00'
@@ -303,7 +303,7 @@ class DBHelper:
         with cls.lock:
             rows = cls.conn_reader.execute(sql, columnar=True)
         assert rows, "没有主力合约数据"
-        assert len(rows[0]) == 1, "主力合约数量不唯一"
+        assert len(rows[0]) == 1, f"主力合约数量不唯一,得到{rows[0]}"
         major_contract = rows[0][0]
         return major_contract
 
@@ -316,7 +316,7 @@ class DBHelper:
         """
         symbol_id = (
             f"{product}___.{exchange}"
-            if exchange == "SHFE"
+            if exchange == "CZCE"
             else f"{product}____.{exchange}"
         )
         sql = f"""
@@ -381,8 +381,8 @@ class DBHelper:
         with cls.lock:
             rows = cls.conn_reader.execute(sql, columnar=True)
         if not rows:
-            logger.warning(f"No data found for {symbols} on {date}")
-            raise AssertionError
+            # logger.warning(f"No data found for {symbols} on {date}")
+            raise AssertionError(f"No data found for {symbols} on {date}")
         if fields == "*":
             columns_info = cls.conn_reader.execute("DESCRIBE TABLE jq.`tick`")
             schemas = [column[0] for column in columns_info]
@@ -472,7 +472,7 @@ class DBHelper:
         symbol_id: str,
         df: pl.DataFrame | pd.DataFrame,
         table: Literal["tick", "1d", "1m"],
-        date: str = "all",
+        date: str | tuple[str, str] = "all",
     ):
         """
         保存数据到sqlite数据库
@@ -481,7 +481,12 @@ class DBHelper:
             df = pl.from_pandas(df)
         with cls.lock:
             cls.writer_conn.import_df(table, df, ("symbol_id", "datetime"))
-        logger.info(f"saved {symbol_id} of {date} data to {table} successfully")
+        if isinstance(date, str):
+            logger.info(f"saved {symbol_id} of {date} data to {table} successfully")
+        else:
+            logger.info(
+                f"saved {symbol_id} of {date[0]}-{date[1]} data to {table} successfully"
+            )
 
     @classmethod
     def get_all_contracts(
@@ -499,15 +504,22 @@ class DBHelper:
         return symbol_ids
 
     @classmethod
-    def insert_records(cls, record):
+    def insert_records(cls, record: Union[dict, list]):
         """
         记录已经处理过的数据日期到mongodb
         """
         with cls.lock:
-            if cls.record_conn.find_one(record):
-                print(f"Record {record} already exists in database.")
-                return
-            cls.record_conn.insert_one(record)
+            if isinstance(record, list):
+                for r in record:
+                    if cls.record_conn.find_one(r):
+                        logger.warning(f"Record {r} already exists in database.")
+                        continue
+                    cls.record_conn.insert_one(r)
+            else:
+                if cls.record_conn.find_one(record):
+                    logger.warning(f"Record {record} already exists in database.")
+                    return
+                cls.record_conn.insert_one(record)
 
     @classmethod
     def is_processed(cls, record) -> bool:
@@ -547,7 +559,7 @@ class DBHelper:
         """
         提取日线数据的symbl_id, datetime字段, 并按照产品分组, 保存到sqlite临时数据库
         """
-        condition = "where match(symbol_id,'^[a-zA-Z]+\\d+.[a-zA-Z]+$') and symbol_id not like '%8888%' and symbol_id not like '%9999%' and paused = 0;"
+        condition = "where match(symbol_id,'^[a-zA-Z]+\\d+.[a-zA-Z]+$') and symbol_id not like '%8888%' and symbol_id not like '%9999%' and paused = 0 and volume > 0;"
         df = cls.get_1d_dat(condition)
         product_gro = cls.group_by_product(df)
         logg = setup_logger("day", "1d_extract.log")
@@ -587,159 +599,502 @@ class DBHelper:
             return result
 
     @staticmethod
-    def get_1m_sql(symbol_id: str, date: str):
+    def get_1m_sql(
+        symbol_id: str,
+        date: str,
+    ) -> str:
         """
         获取1分钟数据sql, date为交易日
         拼index的时候, 需要先拼好上一个交易日的1d数据
         """
         last_date = DBHelper.get_last_trading_day(date)
-        sql = f"""
-            WITH
-                -- 获取前一日的收盘价
-                previous_close AS (
-                    SELECT close AS last_close
-                    FROM jq.`1d`
-                    WHERE symbol_id = '{symbol_id}' AND toDate(datetime) = '{last_date}'
-                    LIMIT 1
-                ),
+        exchange = symbol_id.split(".")[1]
+        if exchange == "CFFEX":
+            sql = f"""
+                WITH
+                    -- 获取前一日的收盘价
+                    previous_close AS (
+                        SELECT close AS last_close
+                        FROM jq.`1d`
+                        WHERE symbol_id = '{symbol_id}' AND toDate(datetime) = '{last_date}'
+                        LIMIT 1
+                    ),
 
-                limits AS (
-                    SELECT
-                        (settlement_price * 1.1) AS high_limit,
-                        (settlement_price * 0.9) AS low_limit
-                    FROM xt.`1d`
-                    WHERE symbol_id = '{symbol_id}' AND toDate(datetime) = '{last_date}'
-                    LIMIT 1
-                ),
+                    limits AS (
+                        SELECT
+                            (settlement_price * 1.1) AS high_limit,
+                            (settlement_price * 0.9) AS low_limit
+                        FROM xt.`1d`
+                        WHERE symbol_id = '{symbol_id}' AND toDate(datetime) = '{last_date}'
+                        LIMIT 1
+                    ),
 
-                pre_today_data AS (
-                SELECT *, ROW_NUMBER() over (order by datetime) as rn
-                FROM jq.tick t
-                WHERE symbol_id = '{symbol_id}'
-                    AND datetime BETWEEN '{last_date} 16:00:00' AND '{date} 15:02:00'
-                ),
+                    pre_today_data AS (
+                        SELECT 
+                            *, ROW_NUMBER() over (order by datetime) as rn
+                        FROM 
+                            jq.tick t
+                        WHERE symbol_id = '{symbol_id}'
+                            AND datetime BETWEEN '{date} 09:25:00' AND '{date} 15:02:00'
+                    ),
 
-                today_data as(
+                    today_data as(
                         SELECT
                                 t1.*,
                         CASE
                             WHEN t2.rn = 0 THEN (t1.volume)
                             ELSE t1.volume - t2.volume
                         END
-                            AS volume_diff
-                    FROM
-                        pre_today_data t1
-                    LEFT JOIN
-                        pre_today_data t2
-                    ON
-                        t1.rn = t2.rn + 1
-                ),
-
-                -- 获取集合竞价期间的数据
-                -- 节假日之前无夜盘, 因此要求COUNT>0
-                auction_night AS (
-                    SELECT
-                        parseDateTime('2024-05-15 21:01:00', '%Y-%m-%d %H:%i:%s') AS minute,
-                        if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayFirst(x -> True, groupArray(current)),arrayFirst(x -> x>0, groupArray(current*(volume_diff>0)))) AS open,
-                        arrayLast(x -> true, groupArray(high*(volume_diff>0))) AS high,
-                        arrayLast(x -> true, groupArray(low*(volume_diff>0))) AS low,
-                        if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayLast(x -> True, groupArray(current)),arrayLast(x -> x>0, groupArray(current*(volume_diff>0)))) AS close,
-                        arrayLast(x -> true, groupArray(volume)) AS volume,
-                        arrayLast(x -> true, groupArray(money)) AS money,
-                        arrayLast(x -> true, groupArray(position)) AS open_interest
-                    FROM today_data
-                    WHERE datetime >= '2024-05-15 20:59:00' AND datetime < '2024-05-15 21:01:00'
-                    HAVING COUNT(*) > 0
-                ),
-
-                -- 除了上期所外, 其他交易所只有一次集合竞价
-                auction_day AS (
-                    SELECT
-                        parseDateTime('2024-05-16 09:01:00', '%Y-%m-%d %H:%i:%s') AS minute,
-                        if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayFirst(x -> True, groupArray(current)),arrayFirst(x -> x>0, groupArray(current*(volume_diff>0)))) AS open,
-                        arrayLast(x -> true, groupArray(high)) AS high,
-                        arrayLast(x -> true, groupArray(low)) AS low,
-                        if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayLast(x -> True, groupArray(current)),arrayLast(x -> x>0, groupArray(current*(volume_diff>0)))) AS close,
-                        arrayLast(x -> true, groupArray(volume)) AS volume,
-                        arrayLast(x -> true, groupArray(money)) AS money,
-                        arrayLast(x -> true, groupArray(position)) AS open_interest
-                    FROM today_data
-                    WHERE datetime >= '2024-05-16 08:59:00' AND datetime < '2024-05-16 09:01:00'
-                    HAVING COUNT(*) > 0
-                ),
-
-                -- 获取正常交易时段的数据
-                normal_data AS (
-                    SELECT
-                        toStartOfMinute(datetime) + INTERVAL 1 MINUTE AS minute,
-                        if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayFirst(x -> True, groupArray(current)),arrayFirst(x -> x>0, groupArray(current*(volume_diff>0)))) AS open,
-                        max(current) AS high,
-                        min(current) AS low,
-                        if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayLast(x -> True, groupArray(current)),arrayLast(x -> x>0, groupArray(current*(volume_diff>0)))) AS close,
-                        arrayLast(x -> true, groupArray(volume)) AS volume,
-                        arrayLast(x -> true, groupArray(money)) AS money,
-                        arrayLast(x -> true, groupArray(position)) AS open_interest
-                    FROM today_data
-                    WHERE symbol_id = '{symbol_id}'
-                        AND datetime BETWEEN '{last_date} 21:01:00' AND '{date} 08:00:00'
-                        or datetime BETWEEN '{date} 09:01:00' AND '{date} 15:00:00'
-                    GROUP BY minute
-                ),
-
-                -- 处理集合竞价未成功的情况
-                combined_data AS (
-                    SELECT
-                        *,
-                        row_number() OVER (ORDER BY minute) AS rn
-                    FROM (
-                        SELECT * FROM auction_day
-                        UNION ALL
-                        SELECT * FROM normal_data
-                        UNION ALL
-                        SELECT * FROM auction_night
-                    ) ORDER BY minute
-                ),
-
-
-                diff AS (
-                    SELECT
-                        t1.*,
-                        t1.volume - t2.volume AS volume_diff,
-                        t1.money - t2.money AS money_diff,
+                            AS volume_diff,
                         CASE
-                            WHEN t2.rn = 0 THEN (SELECT last_close FROM previous_close)
-                            ELSE t2.close
+                            WHEN t2.rn = 0 THEN (t1.money)
+                            ELSE t1.money - t2.money
                         END
-                            AS pre_close
-                    FROM
-                        combined_data t1
-                    LEFT JOIN
-                        combined_data t2
-                    ON
-                        t1.rn = t2.rn + 1
-                    )
+                            AS money_diff
+                        FROM
+                            pre_today_data t1
+                        LEFT JOIN
+                            pre_today_data t2
+                        ON
+                            t1.rn = t2.rn + 1
+                    ),
 
-            -- 最终查询
-            SELECT
-                '{symbol_id}' AS symbol_id,
-                minute as datetime,
-                open,
-                high,
-                low,
-                close,
-                volume_diff AS volume,
-                money_diff AS money,
-                pre_close,
-                (SELECT high_limit FROM limits) AS high_limit,
-                (SELECT low_limit FROM limits) AS low_limit,
-                open_interest
-            FROM diff
-            ORDER BY minute;
 
-        """
+                    noon_close_data as(
+                        SELECT
+                            current,
+                            money_diff,
+                            volume_diff
+                        from
+                            today_data
+                        WHERE
+                            datetime BETWEEN '{date} 11:30:00' AND '{date} 11:40:00'
+                        order by datetime DESC limit 1
+                    ),
+
+                    last_close_data as(
+                        SELECT
+                            current,
+                            money_diff,
+                            volume_diff
+                        from
+                            today_data
+                        WHERE
+                            datetime BETWEEN '{date} 15:00:00' AND '{date} 15:02:00'
+                        order by datetime DESC limit 1
+                    ),
+
+                    -- 获取集合竞价期间的数据
+                    -- 除了上期所外, 其他交易所只有一次集合竞价
+                    auction_day AS (
+                        SELECT
+                            parseDateTime('{date} 09:31:00', '%Y-%m-%d %H:%i:%s') AS minute,
+                            if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayFirst(x -> True, groupArray(current)),arrayFirst(x -> x>0, groupArray(current*(volume_diff>0)))) AS open,
+                            if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayFirst(x -> True, groupArray(current)),arrayMax(groupArray(high*(volume_diff>0)))) AS high,
+                            if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayFirst(x -> True, groupArray(current)),arrayMin(arrayFilter(x -> x > 0, groupArray(low * (volume_diff > 0))))) AS low,
+                            if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayLast(x -> True, groupArray(current)),arrayLast(x -> x>0, groupArray(current*(volume_diff>0)))) AS close,
+                            arrayLast(x -> true, groupArray(volume)) AS volume,
+                            arrayLast(x -> true, groupArray(money)) AS money,
+                            arrayLast(x -> true, groupArray(position)) AS open_interest
+                        FROM today_data
+                        WHERE datetime >= '{date} 09:29:00' AND datetime < '{date} 09:31:00'
+                        HAVING COUNT(*) > 0
+                    ),
+
+                    -- 获取正常交易时段的数据
+                    normal_data AS (
+                        SELECT
+                            toStartOfMinute(datetime) + INTERVAL 1 MINUTE AS minute,
+                            if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayFirst(x -> True, groupArray(current)),arrayFirst(x -> x>0, groupArray(current*(volume_diff>0)))) AS open,
+                            if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayFirst(x -> True, groupArray(current)),arrayMax(groupArray(current*(volume_diff>0)))) AS high,
+                            if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayFirst(x -> True, groupArray(current)),arrayMin(arrayFilter(x -> x > 0, groupArray(current * (volume_diff > 0))))) AS low,
+                            if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayLast(x -> True, groupArray(current)),arrayLast(x -> x>0, groupArray(current*(volume_diff>0)))) AS close,
+                            arrayLast(x -> true, groupArray(volume)) AS volume,
+                            arrayLast(x -> true, groupArray(money)) AS money,
+                            arrayLast(x -> true, groupArray(position)) AS open_interest
+                        FROM today_data
+                        WHERE symbol_id = '{symbol_id}'
+                            AND datetime BETWEEN '{date} 09:31:00' AND '{date} 15:00:00'
+                        GROUP BY minute
+                    ),
+
+                    -- 处理集合竞价未成功的情况
+                    combined_data AS (
+                        SELECT
+                            *,
+                            row_number() OVER (ORDER BY minute) AS rn
+                        FROM (
+                            SELECT * FROM auction_day
+                            UNION ALL
+                            SELECT * FROM normal_data
+                        ) ORDER BY minute
+                    ),
+
+
+                    diff AS (
+                        SELECT
+                            t1.*,
+                            t1.volume - t2.volume AS volume_diff,
+                            t1.money - t2.money AS money_diff,
+                            CASE
+                                WHEN t2.rn = 0 THEN (SELECT last_close FROM previous_close)
+                                ELSE t2.close
+                            END
+                                AS pre_close
+                        FROM
+                            combined_data t1
+                        LEFT JOIN
+                            combined_data t2
+                        ON
+                            t1.rn = t2.rn + 1
+                        )
+
+                -- 最终查询
+                SELECT
+                    '{symbol_id}' AS symbol_id,
+                    minute as datetime,
+                    open,
+                    case
+                        when datetime='{date} 11:30:00' and (SELECT volume_diff from noon_close_data) > 0 THEN GREATEST(high,(SELECT current from noon_close_data))
+                        when datetime='{date} 15:00:00' and (SELECT volume_diff from last_close_data) > 0 THEN GREATEST(high,(SELECT current from last_close_data))
+                        ELSE high
+                    END
+                        as high,
+                    case
+                        when datetime='{date} 11:30:00' and (SELECT volume_diff from noon_close_data) > 0 THEN LEAST(low,(SELECT current from noon_close_data))
+                        when datetime='{date} 15:00:00' and (SELECT volume_diff from last_close_data) > 0 THEN LEAST(low,(SELECT current from last_close_data))
+                        ELSE low
+                    END
+                        as low,
+                    case
+                        when datetime='{date} 11:30:00' and (SELECT volume_diff from noon_close_data) > 0 THEN (SELECT current from noon_close_data)
+                        when datetime='{date} 15:00:00' and (SELECT volume_diff from last_close_data) > 0 THEN (SELECT current from last_close_data)
+                        ELSE close
+                    END
+                        as close,
+                    case
+                        when datetime='{date} 11:30:00' THEN volume_diff+(SELECT volume_diff from noon_close_data)
+                        when datetime='{date} 15:00:00' THEN volume_diff+(SELECT volume_diff from last_close_data)
+                        ELSE volume_diff
+                    END
+                        as volume,
+                    case
+                        when datetime='{date} 11:30:00' THEN money_diff+(SELECT money_diff from noon_close_data)
+                        when datetime='{date} 15:00:00' THEN money_diff+(SELECT money_diff from last_close_data)
+                        ELSE money_diff
+                    END
+                        as money,
+                    pre_close,
+                    (SELECT high_limit FROM limits) AS high_limit,
+                    (SELECT low_limit FROM limits) AS low_limit,
+                    open_interest
+                FROM diff
+                where
+                    datetime not in ('{date} 11:31:00','{date} 15:01:00')
+                ORDER BY minute;
+                """
+        else:
+            sql = f"""
+                WITH
+                    -- 获取前一日的收盘价
+                    previous_close AS (
+                        SELECT close AS last_close
+                        FROM jq.`1d`
+                        WHERE symbol_id = '{symbol_id}' AND toDate(datetime) = '{last_date}'
+                        LIMIT 1
+                    ),
+
+                    limits AS (
+                        SELECT
+                            (settlement_price * 1.1) AS high_limit,
+                            (settlement_price * 0.9) AS low_limit
+                        FROM xt.`1d`
+                        WHERE symbol_id = '{symbol_id}' AND toDate(datetime) = '{last_date}'
+                        LIMIT 1
+                    ),
+
+                    pre_today_data AS (
+                        SELECT 
+                            *, ROW_NUMBER() over (order by datetime) as rn
+                        FROM 
+                            jq.tick t
+                        WHERE symbol_id = '{symbol_id}'
+                            AND datetime BETWEEN '{last_date} 16:00:00' AND '{date} 15:02:00'
+                    ),
+
+                    today_data as(
+                        SELECT
+                                t1.*,
+                        CASE
+                            WHEN t2.rn = 0 THEN (t1.volume)
+                            ELSE t1.volume - t2.volume
+                        END
+                            AS volume_diff,
+                        CASE
+                            WHEN t2.rn = 0 THEN (t1.money)
+                            ELSE t1.money - t2.money
+                        END
+                            AS money_diff
+                        FROM
+                            pre_today_data t1
+                        LEFT JOIN
+                            pre_today_data t2
+                        ON
+                            t1.rn = t2.rn + 1
+                    ),
+                    
+                    mid_close_data as(
+                        SELECT
+                            current,
+                            money_diff,
+                            volume_diff
+                        from
+                            today_data
+                        WHERE 
+                            datetime BETWEEN '{date} 10:15:00' AND '{date} 10:30:00'
+                        order by datetime DESC limit 1
+                    ),
+                    
+                    noon_close_data as(
+                        SELECT
+                            current,
+                            money_diff,
+                            volume_diff
+                        from
+                            today_data
+                        WHERE 
+                            datetime BETWEEN '{date} 11:30:00' AND '{date} 11:40:00'
+                        order by datetime DESC limit 1
+                    ),
+                    
+                    last_close_data as(
+                        SELECT
+                            current,
+                            money_diff,
+                            volume_diff
+                        from
+                            today_data
+                        WHERE 
+                            datetime BETWEEN '{date} 15:00:00' AND '{date} 15:02:00'
+                        order by datetime DESC limit 1
+                    ),
+
+                    -- 获取集合竞价期间的数据
+                    -- 节假日之前无夜盘, 因此要求COUNT>0
+                    auction_night AS (
+                        SELECT
+                            parseDateTime('{last_date} 21:01:00', '%Y-%m-%d %H:%i:%s') AS minute,
+                            if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayFirst(x -> True, groupArray(current)),arrayFirst(x -> x>0, groupArray(current*(volume_diff>0)))) AS open,
+                            if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayFirst(x -> True, groupArray(current)),arrayMax(groupArray(current*(volume_diff>0)))) AS high,
+                            if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayFirst(x -> True, groupArray(current)),arrayMin(arrayFilter(x -> x > 0, groupArray(current * (volume_diff > 0))))) AS low,
+                            if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayLast(x -> True, groupArray(current)),arrayLast(x -> x>0, groupArray(current*(volume_diff>0)))) AS close,
+                            arrayLast(x -> true, groupArray(volume)) AS volume,
+                            arrayLast(x -> true, groupArray(money)) AS money,
+                            arrayLast(x -> true, groupArray(position)) AS open_interest
+                        FROM today_data
+                        WHERE datetime >= '{last_date} 20:59:00' AND datetime < '{last_date} 21:01:00'
+                        HAVING COUNT(*) > 0
+                    ),
+
+                    -- 除了上期所外, 其他交易所只有一次集合竞价
+                    auction_day AS (
+                        SELECT
+                            parseDateTime('{date} 09:01:00', '%Y-%m-%d %H:%i:%s') AS minute,
+                            if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayFirst(x -> True, groupArray(current)),arrayFirst(x -> x>0, groupArray(current*(volume_diff>0)))) AS open,
+                            if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayFirst(x -> True, groupArray(current)),arrayMax(groupArray(current*(volume_diff>0)))) AS high,
+                            if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayFirst(x -> True, groupArray(current)),arrayMin(arrayFilter(x -> x > 0, groupArray(current * (volume_diff > 0))))) AS low,
+                            if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayLast(x -> True, groupArray(current)),arrayLast(x -> x>0, groupArray(current*(volume_diff>0)))) AS close,
+                            arrayLast(x -> true, groupArray(volume)) AS volume,
+                            arrayLast(x -> true, groupArray(money)) AS money,
+                            arrayLast(x -> true, groupArray(position)) AS open_interest
+                        FROM today_data
+                        WHERE datetime >= '{date} 08:59:00' AND datetime < '{date} 09:01:00'
+                        HAVING COUNT(*) > 0
+                    ),
+
+                    -- 获取正常交易时段的数据
+                    normal_data AS (
+                        SELECT
+                            toStartOfMinute(datetime) + INTERVAL 1 MINUTE AS minute,
+                            if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayFirst(x -> True, groupArray(current)),arrayFirst(x -> x>0, groupArray(current*(volume_diff>0)))) AS open,
+                            if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayFirst(x -> True, groupArray(current)),arrayMax(groupArray(current*(volume_diff>0)))) AS high,
+                            if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayFirst(x -> True, groupArray(current)),arrayMin(arrayFilter(x -> x > 0, groupArray(current * (volume_diff > 0))))) AS low,
+                            if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayLast(x -> True, groupArray(current)),arrayLast(x -> x>0, groupArray(current*(volume_diff>0)))) AS close,
+                            arrayLast(x -> true, groupArray(volume)) AS volume,
+                            arrayLast(x -> true, groupArray(money)) AS money,
+                            arrayLast(x -> true, groupArray(position)) AS open_interest
+                        FROM today_data
+                        WHERE symbol_id = '{symbol_id}'
+                            AND datetime BETWEEN '{last_date} 21:01:00' AND '{date} 08:00:00'
+                            or datetime BETWEEN '{date} 09:01:00' AND '{date} 15:00:00'
+                        GROUP BY minute
+                    ),
+
+                    -- 处理集合竞价未成功的情况
+                    combined_data AS (
+                        SELECT
+                            *,
+                            row_number() OVER (ORDER BY minute) AS rn
+                        FROM (
+                            SELECT * FROM auction_day
+                            UNION ALL
+                            SELECT * FROM normal_data
+                            UNION ALL
+                            SELECT * FROM auction_night
+                        ) ORDER BY minute
+                    ),
+
+
+                    diff AS (
+                        SELECT
+                            t1.*,
+                            t1.volume - t2.volume AS volume_diff,
+                            t1.money - t2.money AS money_diff,
+                            CASE
+                                WHEN t2.rn = 0 THEN (SELECT last_close FROM previous_close)
+                                ELSE t2.close
+                            END
+                                AS pre_close
+                        FROM
+                            combined_data t1
+                        LEFT JOIN
+                            combined_data t2
+                        ON
+                            t1.rn = t2.rn + 1
+                        )
+
+                -- 最终查询
+                SELECT
+                    '{symbol_id}' AS symbol_id,
+                    minute as datetime,
+                    open,
+                    case 
+                        when datetime='{date} 10:15:00' and (SELECT volume_diff from mid_close_data) > 0 THEN GREATEST(high,(SELECT current from mid_close_data))
+                        when datetime='{date} 11:30:00' and (SELECT volume_diff from noon_close_data) > 0 THEN GREATEST(high,(SELECT current from noon_close_data))
+                        when datetime='{date} 15:00:00' and (SELECT volume_diff from last_close_data) > 0 THEN GREATEST(high,(SELECT current from last_close_data))
+                        ELSE high
+                    END
+                        as high,
+                    case 
+                        when datetime='{date} 10:15:00' and (SELECT volume_diff from mid_close_data) > 0 THEN LEAST(low,(SELECT current from mid_close_data))
+                        when datetime='{date} 11:30:00' and (SELECT volume_diff from noon_close_data) > 0 THEN LEAST(low,(SELECT current from noon_close_data))
+                        when datetime='{date} 15:00:00' and (SELECT volume_diff from last_close_data) > 0 THEN LEAST(low,(SELECT current from last_close_data))
+                        ELSE low
+                    END
+                        as low,
+                    case 
+                        when datetime='{date} 10:15:00' and (SELECT volume_diff from mid_close_data) > 0 THEN (SELECT current from mid_close_data)
+                        when datetime='{date} 11:30:00' and (SELECT volume_diff from noon_close_data) > 0 THEN (SELECT current from noon_close_data)
+                        when datetime='{date} 15:00:00' and (SELECT volume_diff from last_close_data) > 0 THEN (SELECT current from last_close_data)
+                        ELSE close
+                    END
+                        as close,
+                    case 
+                        when datetime='{date} 10:15:00' THEN volume_diff+(SELECT volume_diff from mid_close_data)
+                        when datetime='{date} 11:30:00' THEN volume_diff+(SELECT volume_diff from noon_close_data)
+                        when datetime='{date} 15:00:00' THEN volume_diff+(SELECT volume_diff from last_close_data)
+                        ELSE volume_diff
+                    END
+                        as volume,
+                    case 
+                        when datetime='{date} 10:15:00' THEN money_diff+(SELECT money_diff from mid_close_data)
+                        when datetime='{date} 11:30:00' THEN money_diff+(SELECT money_diff from noon_close_data)
+                        when datetime='{date} 15:00:00' THEN money_diff+(SELECT money_diff from last_close_data)
+                        ELSE money_diff
+                    END
+                        as money,
+                    pre_close,
+                    (SELECT high_limit FROM limits) AS high_limit,
+                    (SELECT low_limit FROM limits) AS low_limit,
+                    open_interest
+                FROM diff
+                where 
+                    datetime not in ('{date} 10:16:00', '{date} 11:31:00','{date} 15:01:00') 
+                ORDER BY minute;
+
+            """
         return sql
 
     def get_1d_sql(symbol_id: str):
+        exchange = symbol_id.split(".")[1]
+
+        if exchange == "CFFEX":
+            sql = f"""
+            WITH 
+                last_date as (
+                    SELECT 
+                        toStartOfDay(datetime) as last_trade_day
+                    from jq.`1m` m 
+                    WHERE 
+                        symbol_id = '{symbol_id}'
+                    order by last_trade_day DESC limit 1
+                ),
+                
+                last_position as (
+                    SELECT 
+                            position as last_op
+                    from jq.tick t 
+                    WHERE toStartOfDay(datetime) = (SELECT last_trade_day from last_date)
+                    order by datetime DESC limit 1
+                ),
+
+                data_table AS( 
+                    SELECT
+                        *,
+                        toStartOfDay(datetime) AS datetime
+                    FROM jq.`1m`
+                    WHERE 
+                        symbol_id = '{symbol_id}'
+                    order by datetime asc
+                ),
+
+            -- Step 5: Pre-aggregate minute data to handle open, close, high, and low values
+                pre_aggregated_data AS (
+                    SELECT
+                        toStartOfDay(datetime) as datetime ,
+                        arrayFirst(x -> x > 0, groupArray(open * (volume > 0))) AS open,
+                        arrayLast(x -> x > 0, groupArray(close * (volume > 0))) AS close,
+                        arrayFirst(x -> true, groupArray(pre_close)) AS pre_close,
+                        maxIf(high, volume > 0) AS max_high,
+                        minIf(low, volume > 0) AS min_low,
+                        arrayLast(x -> true, groupArray(open_interest)) AS open_interest
+                    FROM
+                        data_table
+                    GROUP BY
+                        datetime
+                )
+
+            -- Step 6: Aggregate final daily data
+            SELECT
+                '{symbol_id}' AS symbol_id,
+                t1.datetime,
+                t1.open,
+                t1.max_high as high,
+                t1.min_low as low,
+                t1.close,
+                t1.pre_close,
+                sum(t2.volume) as volume,
+                sum(t2.money) AS money,
+                any(t2.factor) AS factor,
+                any(t2.paused) AS paused,
+                CASE 
+                    when t1.datetime = (SELECT last_trade_day from last_date) then 0
+                    else t1.open_interest
+                end
+                    as open_interest
+            FROM
+                pre_aggregated_data t1
+            JOIN
+                data_table t2
+            ON
+                t1.datetime = t2.datetime
+            GROUP BY
+                t1.datetime, t1.open, t1.max_high, t1.min_low, t1.close,t1.open_interest,t1.pre_close
+            ORDER BY
+                t1.datetime;
+
+            """
+            return sql
         sql = f"""
             WITH 
                 data_table AS( 
@@ -750,6 +1105,13 @@ class DBHelper:
                     WHERE 
                         symbol_id = '{symbol_id}'
                     order by datetime asc
+                ),
+
+                last_date as (
+                    SELECT 
+                        toStartOfDay(datetime) as last_trade_day
+                    from data_table 
+                    order by last_trade_day DESC limit 1
                 ),
                 
                 -- Step 1: Identify distinct trading sessions
@@ -825,7 +1187,11 @@ class DBHelper:
                 sum(t2.money) AS money,
                 any(t2.factor) AS factor,
                 any(t2.paused) AS paused,
-                t1.open_interest
+                CASE 
+                    when t1.datetime = (SELECT last_trade_day from last_date) then 0
+                    else t1.open_interest
+                end
+                    as open_interest
             FROM 
                 pre_aggregated_data t1
             JOIN 
@@ -838,6 +1204,7 @@ class DBHelper:
                 t1.trading_day;
 
         """
+        return sql
 
 
 def get_term(code: str) -> int:
@@ -946,4 +1313,4 @@ def in_trade_times(product_comma: str, hms: int) -> bool:
 
 
 if __name__ == "__main__":
-    DBHelper.clear_records()
+    print(DBHelper.get_1d_sql("IM2409.CFFEX"))
