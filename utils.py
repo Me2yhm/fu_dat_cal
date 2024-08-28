@@ -53,7 +53,7 @@ class DBHelper:
     # clickhouse
     reader_uri = "clickhouse://reader:d9f6ed24@172.16.7.30:9900/jq?compression=lz4&use_numpy=true"
     conn_reader = clickhouse_driver.Client.from_url(url=reader_uri)
-    # 本地数据库reader，调试用
+    # 本地数据库reader, 调试用
     reader_1d_uri = temp_dir / "future_1d.db"
     try:
         conn_1d = sqlite3.connect(reader_1d_uri, check_same_thread=False)
@@ -61,7 +61,7 @@ class DBHelper:
         create_1d_dbfile()
         conn_1d = sqlite3.connect(reader_1d_uri, check_same_thread=False)
     cursor_1d = conn_1d.cursor()
-    # 本地数据库writer，调试用
+    # 本地数据库writer, 调试用
     writer_uri = "clickhouse://writer:echobest4@localhost:9000/default"
     writer_conn = ClickHouse(writer_uri, 8123)
 
@@ -310,7 +310,7 @@ class DBHelper:
     @classmethod
     def get_secondery_id(cls, product: str, exchange: str, date: str) -> str:
         """
-        获得次主力合约代码，规则是取日线数据持仓量第二大合约
+        获得次主力合约代码, 规则是取日线数据持仓量第二大合约
         注意中金所主力合约的规则不一样
         同花顺规则也不一样（ag,2024-07-22）
         """
@@ -335,19 +335,18 @@ class DBHelper:
         return rows[0][1]
 
     @classmethod
-    @timeit
     def get_last_snapshot(
         cls,
         symbol_ids: np.ndarray,
         date: str = "2024-07-19",
-        fields: str = "symbol_id,datetime,current,a1_v,a1_p,b1_v,b1_p,volume,position",
+        fields: str = "symbol_id,datetime,current,a1_p,b1_p,a1_v,b1_v,volume,position",
     ) -> np.ndarray:
         """
         获取上一个快照数据
         date 需要为交易日。
         """
         start_datetime = " ".join([date, "15:00:00"])
-        end_datetime = " ".join([date, "15:01:00"])
+        end_datetime = " ".join([date, "15:02:00"])
         snapshot = creat_snapshot_array(len(symbol_ids), len(fields.split(",")) - 2)
         idx = 0
         with cls.lock:
@@ -367,18 +366,17 @@ class DBHelper:
         return snapshot
 
     @classmethod
-    @timeit
     def get_symbols_tick(
         cls,
         symbols: list,
         date: str = "2024-07-19",
-        fields: str = "symbol_id,datetime,current,a1_v,a1_p,b1_v,b1_p,volume,position",
+        fields: str = "symbol_id,datetime,current,a1_p,b1_p,a1_v,b1_v,volume,position",
     ):
         """
         获取指定若干合约的Tick数据
         """
         start_datetime = " ".join([cls.get_last_trading_day(date), "20:55:00"])
-        end_datetime = " ".join([date, "15:01:00"])
+        end_datetime = " ".join([date, "15:02:00"])
         sql = f"select {fields} from jq.`tick` where datetime between '{start_datetime}' and  '{end_datetime}' and symbol_id in {tuple(symbols)};"
         with cls.lock:
             rows = cls.conn_reader.execute(sql, columnar=True)
@@ -486,7 +484,6 @@ class DBHelper:
         logger.info(f"saved {symbol_id} of {date} data to {table} successfully")
 
     @classmethod
-    @timeit
     def get_all_contracts(
         cls, product: str, exchange: str, date: str = "2024-07-19"
     ) -> np.ndarray:
@@ -494,7 +491,8 @@ class DBHelper:
         获取所有合约
         """
         sql = f"select symbol_id from {product}_{exchange} where datetime = '{date} 00:00:00';"
-        rows = cls.cursor_1d.execute(sql).fetchall()
+        with cls.lock:
+            rows = cls.cursor_1d.execute(sql).fetchall()
         symbol_ids = List.empty_list(numba.types.unicode_type)
         for row in rows:
             symbol_ids.append(row[0])
@@ -540,6 +538,7 @@ class DBHelper:
         global temp_dir
         db_file = temp_dir / "future_1d.db"
         if db_file.exists():
+            DBHelper.conn_1d.close()
             db_file.unlink()
 
     @classmethod
@@ -591,6 +590,7 @@ class DBHelper:
     def get_1m_sql(symbol_id: str, date: str):
         """
         获取1分钟数据sql, date为交易日
+        拼index的时候, 需要先拼好上一个交易日的1d数据
         """
         last_date = DBHelper.get_last_trading_day(date)
         sql = f"""
@@ -602,69 +602,85 @@ class DBHelper:
                     WHERE symbol_id = '{symbol_id}' AND toDate(datetime) = '{last_date}'
                     LIMIT 1
                 ),
-                
+
                 limits AS (
-                    SELECT 
+                    SELECT
                         (settlement_price * 1.1) AS high_limit,
                         (settlement_price * 0.9) AS low_limit
                     FROM xt.`1d`
-                    WHERE symbol_id = 'ag2409.SHFE' AND toDate(datetime) = '{last_date}'
+                    WHERE symbol_id = '{symbol_id}' AND toDate(datetime) = '{last_date}'
                     LIMIT 1
                 ),
 
-                today_data AS (
-                SELECT *
-                FROM jq.tick t 
-                WHERE symbol_id = 'ag2409.SHFE'
+                pre_today_data AS (
+                SELECT *, ROW_NUMBER() over (order by datetime) as rn
+                FROM jq.tick t
+                WHERE symbol_id = '{symbol_id}'
                     AND datetime BETWEEN '{last_date} 16:00:00' AND '{date} 15:02:00'
                 ),
-                
-                -- 获取集合竞价期间的数据
-                -- 节假日之前无夜盘，因此要求COUNT>0
-                auction_night AS (
-                    SELECT 
-                        parseDateTime('{last_date} 21:01:00', '%Y-%m-%d %H:%i:%s') AS minute,
-                        arrayFirst(x -> true, groupArray(current)) AS open, 
-                        arrayLast(x -> true, groupArray(high)) AS high, 
-                        arrayLast(x -> true, groupArray(low)) AS low,
-                        arrayLast(x -> true, groupArray(current)) AS close, 
-                        arrayLast(x -> true, groupArray(volume)) AS volume,
-                        arrayLast(x -> true, groupArray(money)) AS money,
-                        arrayLast(x -> true, groupArray(position)) AS open_interest
-                    FROM today_data
-                    WHERE datetime >= '{last_date} 20:59:00' AND datetime < '{last_date} 21:01:00'
-                    HAVING COUNT(*) > 0 
+
+                today_data as(
+                        SELECT
+                                t1.*,
+                        CASE
+                            WHEN t2.rn = 0 THEN (t1.volume)
+                            ELSE t1.volume - t2.volume
+                        END
+                            AS volume_diff
+                    FROM
+                        pre_today_data t1
+                    LEFT JOIN
+                        pre_today_data t2
+                    ON
+                        t1.rn = t2.rn + 1
                 ),
 
-                -- 除了上期所外，其他交易所只有一次集合竞价
-                auction_day AS (
-                    SELECT 
-                        parseDateTime('{date} 09:01:00', '%Y-%m-%d %H:%i:%s') AS minute,
-                        arrayFirst(x -> true, groupArray(current)) AS open, 
-                        arrayLast(x -> true, groupArray(high)) AS high, 
-                        arrayLast(x -> true, groupArray(low)) AS low,
-                        arrayLast(x -> true, groupArray(current)) AS close, 
+                -- 获取集合竞价期间的数据
+                -- 节假日之前无夜盘, 因此要求COUNT>0
+                auction_night AS (
+                    SELECT
+                        parseDateTime('2024-05-15 21:01:00', '%Y-%m-%d %H:%i:%s') AS minute,
+                        if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayFirst(x -> True, groupArray(current)),arrayFirst(x -> x>0, groupArray(current*(volume_diff>0)))) AS open,
+                        arrayLast(x -> true, groupArray(high*(volume_diff>0))) AS high,
+                        arrayLast(x -> true, groupArray(low*(volume_diff>0))) AS low,
+                        if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayLast(x -> True, groupArray(current)),arrayLast(x -> x>0, groupArray(current*(volume_diff>0)))) AS close,
                         arrayLast(x -> true, groupArray(volume)) AS volume,
                         arrayLast(x -> true, groupArray(money)) AS money,
                         arrayLast(x -> true, groupArray(position)) AS open_interest
                     FROM today_data
-                    WHERE datetime >= '{date} 08:59:00' AND datetime < '{date} 09:01:00'
+                    WHERE datetime >= '2024-05-15 20:59:00' AND datetime < '2024-05-15 21:01:00'
+                    HAVING COUNT(*) > 0
+                ),
+
+                -- 除了上期所外, 其他交易所只有一次集合竞价
+                auction_day AS (
+                    SELECT
+                        parseDateTime('2024-05-16 09:01:00', '%Y-%m-%d %H:%i:%s') AS minute,
+                        if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayFirst(x -> True, groupArray(current)),arrayFirst(x -> x>0, groupArray(current*(volume_diff>0)))) AS open,
+                        arrayLast(x -> true, groupArray(high)) AS high,
+                        arrayLast(x -> true, groupArray(low)) AS low,
+                        if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayLast(x -> True, groupArray(current)),arrayLast(x -> x>0, groupArray(current*(volume_diff>0)))) AS close,
+                        arrayLast(x -> true, groupArray(volume)) AS volume,
+                        arrayLast(x -> true, groupArray(money)) AS money,
+                        arrayLast(x -> true, groupArray(position)) AS open_interest
+                    FROM today_data
+                    WHERE datetime >= '2024-05-16 08:59:00' AND datetime < '2024-05-16 09:01:00'
                     HAVING COUNT(*) > 0
                 ),
 
                 -- 获取正常交易时段的数据
                 normal_data AS (
-                    SELECT 
+                    SELECT
                         toStartOfMinute(datetime) + INTERVAL 1 MINUTE AS minute,
-                        arrayFirst(x -> true, groupArray(current)) AS open, 
-                        max(current) AS high, 
-                        min(current) AS low, 
-                        arrayLast(x -> true, groupArray(current)) AS close, 
+                        if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayFirst(x -> True, groupArray(current)),arrayFirst(x -> x>0, groupArray(current*(volume_diff>0)))) AS open,
+                        max(current) AS high,
+                        min(current) AS low,
+                        if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayLast(x -> True, groupArray(current)),arrayLast(x -> x>0, groupArray(current*(volume_diff>0)))) AS close,
                         arrayLast(x -> true, groupArray(volume)) AS volume,
                         arrayLast(x -> true, groupArray(money)) AS money,
                         arrayLast(x -> true, groupArray(position)) AS open_interest
                     FROM today_data
-                    WHERE symbol_id = 'ag2409.SHFE'
+                    WHERE symbol_id = '{symbol_id}'
                         AND datetime BETWEEN '{last_date} 21:01:00' AND '{date} 08:00:00'
                         or datetime BETWEEN '{date} 09:01:00' AND '{date} 15:00:00'
                     GROUP BY minute
@@ -672,7 +688,7 @@ class DBHelper:
 
                 -- 处理集合竞价未成功的情况
                 combined_data AS (
-                    SELECT 
+                    SELECT
                         *,
                         row_number() OVER (ORDER BY minute) AS rn
                     FROM (
@@ -683,28 +699,28 @@ class DBHelper:
                         SELECT * FROM auction_night
                     ) ORDER BY minute
                 ),
-                
+
 
                 diff AS (
                     SELECT
                         t1.*,
                         t1.volume - t2.volume AS volume_diff,
                         t1.money - t2.money AS money_diff,
-                        CASE 
+                        CASE
                             WHEN t2.rn = 0 THEN (SELECT last_close FROM previous_close)
                             ELSE t2.close
                         END
                             AS pre_close
-                    FROM 
+                    FROM
                         combined_data t1
-                    LEFT JOIN 
+                    LEFT JOIN
                         combined_data t2
-                    ON 
+                    ON
                         t1.rn = t2.rn + 1
-                    )   
-                
+                    )
+
             -- 最终查询
-            SELECT 
+            SELECT
                 '{symbol_id}' AS symbol_id,
                 minute as datetime,
                 open,
@@ -722,6 +738,106 @@ class DBHelper:
 
         """
         return sql
+
+    def get_1d_sql(symbol_id: str):
+        sql = f"""
+            WITH 
+                data_table AS( 
+                    SELECT
+                        *,
+                        toStartOfDay(datetime - INTERVAL 3 hour) AS trading_date
+                    FROM jq.`1m`
+                    WHERE 
+                        symbol_id = '{symbol_id}'
+                    order by datetime asc
+                ),
+                
+                -- Step 1: Identify distinct trading sessions
+                trading_sessions AS (
+                    SELECT
+                        trading_date
+                    FROM data_table
+                    GROUP BY trading_date
+                ),
+
+                -- Step 2: Add row numbers to the trading sessions
+                session_intervals AS (
+                    SELECT 
+                        trading_date, 
+                        ROW_NUMBER() OVER (ORDER BY trading_date) AS rn
+                    FROM trading_sessions
+                ),
+
+                -- Step 3: Create intervals by self-joining on row numbers
+                --有个bug, 如果最后一天不是到期日, 则还有夜盘, 最后一天的交易日划分就会有问题
+                date_intervals AS (
+                    SELECT 
+                        t1.trading_date AS start_datetime,
+                        if(t2.rn >0,t2.trading_date,t1.trading_date) AS end_datetime
+                    FROM 
+                        session_intervals t1
+                    LEFT JOIN 
+                        session_intervals t2 ON t1.rn + 1 = t2.rn
+                ),
+
+                -- Step 4: Combine minute data with identified trading sessions
+                minute_data_with_sessions AS (
+                    SELECT 
+                        t1.*,
+                        CASE 
+                            WHEN toHour(t1.datetime) >= 21 OR toHour(t1.datetime)<7 THEN t2.end_datetime
+                            ELSE t2.start_datetime
+                        END AS trading_day
+                    FROM 
+                        data_table t1
+                    full JOIN 
+                        date_intervals t2
+                    ON 
+                        t1.trading_date = t2.start_datetime 
+                ),
+
+            -- Step 5: Pre-aggregate minute data to handle open, close, high, and low values
+                pre_aggregated_data AS (
+                    SELECT
+                        trading_day,
+                        arrayFirst(x -> x > 0, groupArray(open * (volume > 0))) AS open,
+                        arrayLast(x -> x > 0, groupArray(close * (volume > 0))) AS close,
+                        arrayFirst(x -> true, groupArray(pre_close)) AS pre_close,
+                        maxIf(high, volume > 0) AS max_high,
+                        minIf(low, volume > 0) AS min_low,
+                        arrayLast(x -> true, groupArray(open_interest)) AS open_interest
+                    FROM 
+                        minute_data_with_sessions
+                    GROUP BY 
+                        trading_day
+                )
+
+            -- Step 6: Aggregate final daily data
+            SELECT
+                '{symbol_id}' AS symbol_id,
+                t1.trading_day AS datetime,
+                t1.open,
+                t1.max_high AS high,
+                t1.min_low AS low,
+                t1.close,
+                t1.pre_close,
+                sum(t2.volume) AS volume,
+                sum(t2.money) AS money,
+                any(t2.factor) AS factor,
+                any(t2.paused) AS paused,
+                t1.open_interest
+            FROM 
+                pre_aggregated_data t1
+            JOIN 
+                minute_data_with_sessions t2
+            ON 
+                t1.trading_day = t2.trading_day
+            GROUP BY 
+                t1.trading_day, t1.open, t1.max_high, t1.min_low, t1.close,t1.open_interest,t1.pre_close
+            ORDER BY 
+                t1.trading_day;
+
+        """
 
 
 def get_term(code: str) -> int:
@@ -830,4 +946,4 @@ def in_trade_times(product_comma: str, hms: int) -> bool:
 
 
 if __name__ == "__main__":
-    print(DBHelper.get_mayjor_contract_id("OI", "CZCE", "2012-07-17"))
+    DBHelper.clear_records()

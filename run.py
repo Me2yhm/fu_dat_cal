@@ -19,7 +19,7 @@ from utils import DBHelper as db
 
 
 class Processer:
-    max_workers = 3
+    max_workers = 2
 
     @classmethod
     @timeit
@@ -44,13 +44,13 @@ class Processer:
                     if processed_dates is not None:
                         results[product] = processed_dates
                 except Exception as e:
+                    print(processed_dates)
                     logger.error(
                         f"[{e.__class__.__name__}] Processe Error {product}: {e}"
                     )
         return results
 
     @staticmethod
-    @timeit
     @njit()
     def execute_single_pro(
         snap_shots: np.ndarray,
@@ -77,20 +77,21 @@ class Processer:
             symbol_idx = row[0]
             new_datetime = row[1]
             if new_datetime != last_datetime:
-                if not last_datetime_intrade:
+                if last_datetime_intrade:
+                    value, high, low = cal_value(snap_shots, last_datetime, high, low)
+                    values[value_index] = value
+                    value_index += 1
+                    last_datetime = new_datetime
+                else:
                     last_datetime = new_datetime
                     last_datetime_intrade = True
-                    continue
-                value, high, low = cal_value(snap_shots, last_datetime, high, low)
-                values[value_index] = value
-                value_index += 1
-                last_datetime = new_datetime
             snap_shots[symbol_idx] = [
                 row["current"],
-                row["a1_v"],
                 row["a1_p"],
-                row["b1_v"],
                 row["b1_p"],
+                row["money"],
+                row["a1_v"],
+                row["b1_v"],
                 row["volume"],
                 row["position"],
             ]  # symbol_idx会不会有缺失值？
@@ -102,7 +103,6 @@ class Processer:
         return values[:value_index]
 
     @classmethod
-    @timeit
     def index_dat_preprocess(cls, tick_data: pl.DataFrame) -> pl.DataFrame:
         """
         指数数据预处理, 将symbol_id转化为分类索引, 并将datetime转化为timestamp
@@ -120,7 +120,6 @@ class Processer:
         return tick_data
 
     @classmethod
-    @timeit
     def dat_to_struct_arr(cls, tick_data: pl.DataFrame) -> np.ndarray:
         """
         将pl.DataFrame转换为numpy结构数组。根据列式存储加快转换速度
@@ -134,7 +133,6 @@ class Processer:
         return struct_arr
 
     @classmethod
-    @timeit
     def index_dat_postprocess(
         cls, values: np.ndarray, columns: list, product: str, exchange: str
     ) -> pd.DataFrame:
@@ -163,11 +161,11 @@ class Processer:
         """
         symbol_id = f"{product}8888.{exchange}"
         record = {"symbol_id": symbol_id, "date": date}
-        # if db.is_processed(record):
-        #     logger.warning(f"{symbol_id} of {date} data has been processed")
-        #     return
+        if db.is_processed(record):
+            logger.warning(f"{symbol_id} of {date} data has been processed")
+            return
         # 新合约的处理：空行填充
-        fields = "symbol_id,datetime,current,a1_p,b1_p,b1_v,a1_v,volume,position"
+        fields = "symbol_id,datetime,current,a1_p,b1_p,money,a1_v,b1_v,volume,position"
         symbol_ids = db.get_all_contracts(product, exchange, date)
         tick_data = db.get_symbols_tick(symbol_ids, date, fields).sort(
             by="datetime"
@@ -183,8 +181,8 @@ class Processer:
         columns = fields.split(",") + ["high", "low"]
         index_df = cls.index_dat_postprocess(values, columns, product, exchange)
         db.save_db(symbol_id, index_df, "tick", date)
-        # db.insert_records(record)
-        logger.success(f"{symbol_id} of {date} have been processed")
+        db.insert_records(record)
+        logger.success(f"Process {symbol_id} of {date} successfully")
         return f"{symbol_id}-{date}"
 
     @classmethod
@@ -204,7 +202,6 @@ class Processer:
                 futures[executor.submit(cls.save_1d_index, product, exchange, date)] = (
                     date
                 )
-                break
             for future in as_completed(futures):
                 try:
                     result = future.result()
@@ -219,7 +216,7 @@ class Processer:
 
     @classmethod
     @timeit
-    def cal_future_index(cls):
+    def process_future_index(cls):
         """
         计算期货指数主函数
         """
@@ -250,18 +247,18 @@ class Processer:
         """
         symbol_id = f"{product}7777.{exchange}"
         record = {"symbol_id": symbol_id, "date": date}
-        fields = "symbol_id,datetime,current,a1_v,a1_p,b1_v,b1_p,volume,position,high,low,money"
-        # if db.is_processed(record):
-        #     Logger.warning(f"{symbol_id} of {date} data has been processed")
-        #     return
+        fields = "symbol_id,datetime,current,a1_p,b1_p,a1_v,b1_v,volume,position,high,low,money"
+        if db.is_processed(record):
+            Logger.warning(f"{symbol_id} of {date} data has been processed")
+            return
         secondery = db.get_secondery_id(product, exchange, date)
         secondery_df = db.get_symbols_tick([secondery], date, fields).sort(
             by="datetime"
         )
         secondery_df = cls.secondery_dat_postprocess(secondery_df, symbol_id)
         db.save_db(symbol_id, secondery_df, "tick", date)
-        # db.insert_records(record)
-        logger.success(f"{symbol_id} of {date} have been processed")
+        db.insert_records(record)
+        logger.success(f"Process {symbol_id} of {date} successfully")
         return date
 
     @classmethod
@@ -345,15 +342,15 @@ class Processer:
         """
         symbol_id = f"{product}9999.{exchange}"
         record = {"symbol_id": symbol_id, "date": "all"}
-        # if db.is_processed(record):
-        #     Logger.warning(f"{symbol_id} of all data has been processed")
-        #     return
+        if db.is_processed(record):
+            Logger.warning(f"{symbol_id} of all data has been processed")
+            return
         logger.info(f"Processing {symbol_id}")
         major_contract = db.get_mayjor_contract_dat(product, exchange)
         if major_contract:
             major_contract = cls.mayjor_dat_postprocess(major_contract, symbol_id)
             db.save_db(symbol_id, major_contract, "tick", "all")
-            # db.insert_records(record)
+            db.insert_records(record)
             logger.success(f"{symbol_id} have been processed successfully")
         return symbol_id
 
@@ -375,7 +372,6 @@ class Processer:
                 futures[executor.submit(cls.save_1d_major, product, exchange, date)] = (
                     date
                 )
-                break
             for future in as_completed(futures):
                 try:
                     processed_date = future.result()
@@ -385,6 +381,7 @@ class Processer:
                     logger.error(
                         f"[{e.__class__.__name__}] Thread Error: {product}_{exchange}_{processed_date}: {e}"
                     )
+                    return None
         return results
 
     @classmethod
@@ -394,16 +391,16 @@ class Processer:
         """
         symbol_id = f"{product}9999.{exchange}"
         record = {"symbol_id": symbol_id, "date": date}
-        field = "symbol_id,datetime,current,a1_v,a1_p,b1_v,b1_p,volume,position,high,low,money"
-        # if db.is_processed(record):
-        #     Logger.warning(f"{symbol_id} of {date} data has been processed")
-        #     return
+        field = "symbol_id,datetime,current,a1_p,b1_p,a1_v,b1_v,volume,position,high,low,money"
+        if db.is_processed(record):
+            Logger.warning(f"{symbol_id} of {date} data has been processed")
+            return
         major_contract = db.get_mayjor_contract_id(product, exchange, date, field)
         mayjor_df = db.get_symbols_tick([major_contract], date)
         mayjor_df = cls.mayjor_dat_postprocess(mayjor_df, symbol_id)
         db.save_db(symbol_id, mayjor_df, "tick", date)
-        # db.insert_records(record)
-        logger.success(f"{symbol_id} of {date} have been processed")
+        db.insert_records(record)
+        logger.success(f"Process {symbol_id} of {date} successfully")
         return date
 
     @classmethod
@@ -443,7 +440,9 @@ def cal_value(snapshot: np.ndarray, datetime: float, high: float, low: float):
         return value, high, low
     total_position = position.sum()
 
-    value[2:-4] = (position @ snapshot[:, :-2]) / total_position
+    value[2:5] = (position @ snapshot[:, :3]) / total_position
+    for i in range(5, snapshot.shape[1] + 2):
+        value[i] = snapshot[:, i - 2].sum()
     current = value[2]
     if current >= high or high == 0:
         high = current
@@ -451,8 +450,8 @@ def cal_value(snapshot: np.ndarray, datetime: float, high: float, low: float):
         low = current
 
     value[1] = datetime
-    value[-4] = snapshot[:, -2].sum()
-    value[-3] = total_position
+    # value[-4] = snapshot[:, -2].sum()
+    # value[-3] = total_position
     value[-2] = high
     value[-1] = low
     return value, high, low
@@ -460,13 +459,14 @@ def cal_value(snapshot: np.ndarray, datetime: float, high: float, low: float):
 
 if __name__ == "__main__":
     try:
-        # db.execute_1d_extract()
+        db.execute_1d_extract()
         logger.remove()
         logger.add(sys.stderr, level="WARNING")
-        # logger.add("logs/index.log", level="WARNING", rotation="10 MB")
-        results = Processer.cal_future_index()
+        logger.add("logs/index.log", level="WARNING", rotation="10 MB")
+        results = Processer.process_single_index_product("CY", "CZCE")
         breakpoint()
-        # Processer.save_1d_index("ag", "SHFE", "2012-05-11")
+    except Exception as e:
+        logger.error(f"[{e.__class__.__name__}] Error:: {e}")
     finally:
-        # db.delete_1d_dbfile()
+        db.delete_1d_dbfile()
         pass
