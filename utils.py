@@ -423,6 +423,54 @@ class DBHelper:
         return product_dict
 
     @classmethod
+    def get_index_dict(cls) -> dict[str, str]:
+        """
+        获得所有产品和交易所组成的字典
+        """
+        with cls.lock:
+            rows = cls.cursor_1d.execute(
+                "SELECT name FROM sqlite_master WHERE type='table';"
+            ).fetchall()
+        product_dict = {}
+        for row in rows:
+            product_name, exchange_name = row[0].split("_")
+            if product_name not in product_dict and "8888" in product_name:
+                product_dict[product_name] = exchange_name
+        return product_dict
+
+    @classmethod
+    def get_mayjor_dict(cls) -> dict[str, str]:
+        """
+        获得所有产品和交易所组成的字典
+        """
+        with cls.lock:
+            rows = cls.cursor_1d.execute(
+                "SELECT name FROM sqlite_master WHERE type='table';"
+            ).fetchall()
+        product_dict = {}
+        for row in rows:
+            product_name, exchange_name = row[0].split("_")
+            if product_name not in product_dict and "9999" in product_name:
+                product_dict[product_name] = exchange_name
+        return product_dict
+
+    @classmethod
+    def get_secondery_dict(cls) -> dict[str, str]:
+        """
+        获得所有产品和交易所组成的字典
+        """
+        with cls.lock:
+            rows = cls.cursor_1d.execute(
+                "SELECT name FROM sqlite_master WHERE type='table';"
+            ).fetchall()
+        product_dict = {}
+        for row in rows:
+            product_name, exchange_name = row[0].split("_")
+            if product_name not in product_dict and "7777" in product_name:
+                product_dict[product_name] = exchange_name
+        return product_dict
+
+    @classmethod
     def get_pro_dates(cls, product: str, exchange: str) -> list:
         """
         获取指定品种的交易日列表, 以日线交易日列表为基准
@@ -512,14 +560,32 @@ class DBHelper:
             if isinstance(record, list):
                 for r in record:
                     if cls.record_conn.find_one(r):
-                        logger.warning(f"Record {r} already exists in database.")
+                        logger.warning(f"Record {r} already exists in mongodb.")
                         continue
                     cls.record_conn.insert_one(r)
             else:
                 if cls.record_conn.find_one(record):
-                    logger.warning(f"Record {record} already exists in database.")
+                    logger.warning(f"Record {record} already exists in mongodb.")
                     return
                 cls.record_conn.insert_one(record)
+
+    @classmethod
+    def update_records(cls, record: Union[dict, list]):
+        """
+        更新已经处理过的数据日期到mongodb
+        """
+        with cls.lock:
+            if isinstance(record, list):
+                for r in record:
+                    date_range = r["date"]
+                    del r["date"]
+                    cls.record_conn.update_one(r, {"$set": {"date": date_range}})
+                    logger.info(f"Updated records {r} in mongodb.")
+            else:
+                date_range = record["date"]
+                del record["date"]
+                cls.record_conn.update_one(record, {"$set": {"date": date_range}})
+                logger.info(f"Updated record {record} in mongodb.")
 
     @classmethod
     def is_processed(cls, record) -> bool:
@@ -554,7 +620,6 @@ class DBHelper:
             db_file.unlink()
 
     @classmethod
-    @timeit
     def execute_1d_extract(cls):
         """
         提取日线数据的symbl_id, datetime字段, 并按照产品分组, 保存到sqlite临时数据库
@@ -574,6 +639,30 @@ class DBHelper:
             cls.save_1d_dat(dat, pro[0], exchange)
             cls.insert_records(record)
             logg.info(f"Saved {pro[0]} of {exchange} data to future_1d.db successfully")
+
+    @classmethod
+    def extract_three_kinds_1d(cls, kind: Literal["9999", "8888", "7777"]):
+        """
+        提取日线index数据的symbl_id, datetime字段, 并按照产品分组, 保存到sqlite临时数据库
+        """
+        condition = f"where symbol_id like '%{kind}%' and paused = 0 and volume > 0;"
+        df = cls.get_1d_dat(condition)
+        product_gro = cls.group_by_product(df)
+        logg = setup_logger("day", "1d_extract.log")
+        for pro, dat in product_gro:
+            product = f"{pro[0]}{kind}"
+            record = {"product": f"{product}", "date": "all", "type": "day"}
+            if cls.is_processed(record):
+                logg.warning(f"{product} of {dat['exchange'][0]} already processed")
+                continue
+            exchange = dat["exchange"][0]
+            dat = dat.drop("pro_part")
+            dat = dat.sort("datetime")
+            cls.save_1d_dat(dat, product, exchange)
+            cls.insert_records(record)
+            logg.info(
+                f"Saved {product} of {exchange} data to future_1d.db successfully"
+            )
 
     @classmethod
     @timeit
@@ -602,6 +691,7 @@ class DBHelper:
     def get_1m_sql(
         symbol_id: str,
         date: str,
+        database: Literal["jq", "xt", "default"] = "jq",
     ) -> str:
         """
         获取1分钟数据sql, date为交易日
@@ -615,25 +705,25 @@ class DBHelper:
                     -- 获取前一日的收盘价
                     previous_close AS (
                         SELECT close AS last_close
-                        FROM jq.`1d`
+                        FROM {database}.`1d`
                         WHERE symbol_id = '{symbol_id}' AND toDate(datetime) = '{last_date}'
                         LIMIT 1
                     ),
 
-                    limits AS (
-                        SELECT
-                            (settlement_price * 1.1) AS high_limit,
-                            (settlement_price * 0.9) AS low_limit
-                        FROM xt.`1d`
-                        WHERE symbol_id = '{symbol_id}' AND toDate(datetime) = '{last_date}'
-                        LIMIT 1
-                    ),
+                    -- limits AS (
+                    --     SELECT
+                    --         (settlement_price * 1.1) AS high_limit,
+                    --         (settlement_price * 0.9) AS low_limit
+                    --     FROM xt.`1d`
+                    --     WHERE symbol_id = '{symbol_id}' AND toDate(datetime) = '{last_date}'
+                    --     LIMIT 1
+                    -- ),
 
                     pre_today_data AS (
                         SELECT 
                             *, ROW_NUMBER() over (order by datetime) as rn
                         FROM 
-                            jq.tick t
+                            {database}.tick t
                         WHERE symbol_id = '{symbol_id}'
                             AND datetime BETWEEN '{date} 09:25:00' AND '{date} 15:02:00'
                     ),
@@ -688,7 +778,7 @@ class DBHelper:
                     -- 除了上期所外, 其他交易所只有一次集合竞价
                     auction_day AS (
                         SELECT
-                            parseDateTime('{date} 09:31:00', '%Y-%m-%d %H:%i:%s') AS minute,
+                            toDateTime('{date} 09:31:00') AS minute,
                             if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayFirst(x -> True, groupArray(current)),arrayFirst(x -> x>0, groupArray(current*(volume_diff>0)))) AS open,
                             if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayFirst(x -> True, groupArray(current)),arrayMax(groupArray(high*(volume_diff>0)))) AS high,
                             if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayFirst(x -> True, groupArray(current)),arrayMin(arrayFilter(x -> x > 0, groupArray(low * (volume_diff > 0))))) AS low,
@@ -785,8 +875,8 @@ class DBHelper:
                     END
                         as money,
                     pre_close,
-                    (SELECT high_limit FROM limits) AS high_limit,
-                    (SELECT low_limit FROM limits) AS low_limit,
+                    -- (SELECT high_limit FROM limits) AS high_limit,
+                    -- (SELECT low_limit FROM limits) AS low_limit,
                     open_interest
                 FROM diff
                 where
@@ -799,25 +889,25 @@ class DBHelper:
                     -- 获取前一日的收盘价
                     previous_close AS (
                         SELECT close AS last_close
-                        FROM jq.`1d`
+                        FROM {database}.`1d`
                         WHERE symbol_id = '{symbol_id}' AND toDate(datetime) = '{last_date}'
                         LIMIT 1
                     ),
 
-                    limits AS (
-                        SELECT
-                            (settlement_price * 1.1) AS high_limit,
-                            (settlement_price * 0.9) AS low_limit
-                        FROM xt.`1d`
-                        WHERE symbol_id = '{symbol_id}' AND toDate(datetime) = '{last_date}'
-                        LIMIT 1
-                    ),
+                    -- limits AS (
+                    --     SELECT
+                    --        (settlement_price * 1.1) AS high_limit,
+                    --        (settlement_price * 0.9) AS low_limit
+                    --     FROM xt.`1d`
+                    --     WHERE symbol_id = '{symbol_id}' AND toDate(datetime) = '{last_date}'
+                    --     LIMIT 1
+                    -- ),
 
                     pre_today_data AS (
                         SELECT 
                             *, ROW_NUMBER() over (order by datetime) as rn
                         FROM 
-                            jq.tick t
+                            {database}.tick t
                         WHERE symbol_id = '{symbol_id}'
                             AND datetime BETWEEN '{last_date} 16:00:00' AND '{date} 15:02:00'
                     ),
@@ -883,7 +973,7 @@ class DBHelper:
                     -- 节假日之前无夜盘, 因此要求COUNT>0
                     auction_night AS (
                         SELECT
-                            parseDateTime('{last_date} 21:01:00', '%Y-%m-%d %H:%i:%s') AS minute,
+                            toDateTime('{last_date} 21:01:00') AS minute,
                             if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayFirst(x -> True, groupArray(current)),arrayFirst(x -> x>0, groupArray(current*(volume_diff>0)))) AS open,
                             if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayFirst(x -> True, groupArray(current)),arrayMax(groupArray(current*(volume_diff>0)))) AS high,
                             if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayFirst(x -> True, groupArray(current)),arrayMin(arrayFilter(x -> x > 0, groupArray(current * (volume_diff > 0))))) AS low,
@@ -899,7 +989,7 @@ class DBHelper:
                     -- 除了上期所外, 其他交易所只有一次集合竞价
                     auction_day AS (
                         SELECT
-                            parseDateTime('{date} 09:01:00', '%Y-%m-%d %H:%i:%s') AS minute,
+                            toDateTime('{date} 09:01:00') AS minute,
                             if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayFirst(x -> True, groupArray(current)),arrayFirst(x -> x>0, groupArray(current*(volume_diff>0)))) AS open,
                             if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayFirst(x -> True, groupArray(current)),arrayMax(groupArray(current*(volume_diff>0)))) AS high,
                             if(arrayAll(x -> x = 0,groupArray(volume_diff>0)), arrayFirst(x -> True, groupArray(current)),arrayMin(arrayFilter(x -> x > 0, groupArray(current * (volume_diff > 0))))) AS low,
@@ -1004,8 +1094,8 @@ class DBHelper:
                     END
                         as money,
                     pre_close,
-                    (SELECT high_limit FROM limits) AS high_limit,
-                    (SELECT low_limit FROM limits) AS low_limit,
+                    -- (SELECT high_limit FROM limits) AS high_limit,
+                    -- (SELECT low_limit FROM limits) AS low_limit,
                     open_interest
                 FROM diff
                 where 
@@ -1015,7 +1105,7 @@ class DBHelper:
             """
         return sql
 
-    def get_1d_sql(symbol_id: str):
+    def get_1d_sql(symbol_id: str, database: Literal["jq", "xt", "default"] = "jq"):
         exchange = symbol_id.split(".")[1]
 
         if exchange == "CFFEX":
@@ -1024,7 +1114,7 @@ class DBHelper:
                 last_date as (
                     SELECT 
                         toStartOfDay(datetime) as last_trade_day
-                    from jq.`1m` m 
+                    from {database}.`1m` m 
                     WHERE 
                         symbol_id = '{symbol_id}'
                     order by last_trade_day DESC limit 1
@@ -1033,7 +1123,7 @@ class DBHelper:
                 last_position as (
                     SELECT 
                             position as last_op
-                    from jq.tick t 
+                    from {database}.tick t 
                     WHERE toStartOfDay(datetime) = (SELECT last_trade_day from last_date)
                     order by datetime DESC limit 1
                 ),
@@ -1042,7 +1132,7 @@ class DBHelper:
                     SELECT
                         *,
                         toStartOfDay(datetime) AS datetime
-                    FROM jq.`1m`
+                    FROM {database}.`1m`
                     WHERE 
                         symbol_id = '{symbol_id}'
                     order by datetime asc
@@ -1078,7 +1168,7 @@ class DBHelper:
                 any(t2.factor) AS factor,
                 any(t2.paused) AS paused,
                 CASE 
-                    when t1.datetime = (SELECT last_trade_day from last_date) then 0
+                    when t1.datetime = (SELECT last_trade_day from last_date) then (SELECT last_op From last_position)
                     else t1.open_interest
                 end
                     as open_interest
@@ -1101,7 +1191,7 @@ class DBHelper:
                     SELECT
                         *,
                         toStartOfDay(datetime - INTERVAL 3 hour) AS trading_date
-                    FROM jq.`1m`
+                    FROM {database}.`1m`
                     WHERE 
                         symbol_id = '{symbol_id}'
                     order by datetime asc
@@ -1112,6 +1202,14 @@ class DBHelper:
                         toStartOfDay(datetime) as last_trade_day
                     from data_table 
                     order by last_trade_day DESC limit 1
+                ),
+                -- 有一个问题, 如果是到期日, 则最后一天的op应该为0
+                last_position as (
+                    SELECT 
+                            position as last_op
+                    from {database}.tick t 
+                    WHERE toStartOfDay(datetime) = (SELECT last_trade_day from last_date)
+                    order by datetime DESC limit 1
                 ),
                 
                 -- Step 1: Identify distinct trading sessions
@@ -1188,7 +1286,7 @@ class DBHelper:
                 any(t2.factor) AS factor,
                 any(t2.paused) AS paused,
                 CASE 
-                    when t1.datetime = (SELECT last_trade_day from last_date) then 0
+                    when t1.trading_day = (SELECT last_trade_day from last_date) then (SELECT last_op From last_position)
                     else t1.open_interest
                 end
                     as open_interest
@@ -1313,4 +1411,4 @@ def in_trade_times(product_comma: str, hms: int) -> bool:
 
 
 if __name__ == "__main__":
-    print(DBHelper.get_1d_sql("IM2409.CFFEX"))
+    print(DBHelper.get_1d_sql("i8888.DCE"))
