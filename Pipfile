@@ -1,0 +1,23 @@
+[[source]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+verify_ssl = true
+name = "pip_conf_index_global"
+
+[packages]
+pymongo = "*"
+loguru = "*"
+numpy = "*"
+pandas = "*"
+polars = "*"
+clickhouse-driver = "*"
+numba = "*"
+pipfile = "*"
+jy-lib = "*"
+scipy = "*"
+jqdatasdk = "*"
+tushare = "*"
+
+[dev-packages]
+
+[requires]
+python_version = "3.11"

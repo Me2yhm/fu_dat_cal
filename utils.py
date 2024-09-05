@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 import sqlite3
 import time
-from typing import Literal, Union
+from typing import Literal, Tuple, Union
 
 import numba
 import pandas as pd
@@ -26,9 +26,8 @@ log_root_dir = Path(__file__).parent / "log"
 temp_dir = Path(__file__).parent / "temp"
 
 
-def create_1d_dbfile():
+def create_1d_dbfile(db_file: Path):
     temp_dir.mkdir(exist_ok=True)
-    db_file = temp_dir / "future_1d.db"
     if not db_file.exists():
         db_file.touch()
 
@@ -40,7 +39,7 @@ def timeit(func):
         result = func(*args, **kwargs)  # 调用被装饰的函数
         end_time = time.time()  # 记录结束时间
         elapsed_time = end_time - start_time  # 计算运行时间
-        logger.info(
+        logger.debug(
             f"Function '{func.__name__}' executed in {elapsed_time:.4f} seconds"
         )
         return result  # 返回函数的结果
@@ -56,13 +55,14 @@ class DBHelper:
     # 本地数据库reader, 调试用
     reader_1d_uri = temp_dir / "future_1d.db"
     try:
+        db_file = temp_dir / "future_1d.db"
         conn_1d = sqlite3.connect(reader_1d_uri, check_same_thread=False)
     except sqlite3.OperationalError:
-        create_1d_dbfile()
+        create_1d_dbfile(db_file)
         conn_1d = sqlite3.connect(reader_1d_uri, check_same_thread=False)
     cursor_1d = conn_1d.cursor()
     # 本地数据库writer, 调试用
-    writer_uri = "clickhouse://writer:echobest4@localhost:9000/default"
+    writer_uri = "clickhouse://writer:echobest4@localhost:9000/default?compression=lz4&use_numpy=true"
     writer_conn = ClickHouse(writer_uri, 8123)
 
     logger = setup_logger("DBHelper", "db_helper.log")
@@ -82,14 +82,16 @@ class DBHelper:
     }
 
     @classmethod
-    def init_writer_table(cls, table_name: Literal["tick", "1d", "1m"]):
+    def init_writer_table(
+        cls, table_name: Literal["merged_tick", "merged_1d", "merged_1m", "merged"]
+    ):
         """
         创建clickhouse表, 用于写入数据
         """
         collection = "default"
-        if table_name == "tick":
+        if table_name == "merged_tick":
             sql = f"""
-            CREATE TABLE IF NOT EXISTS {collection}.tick
+            CREATE TABLE IF NOT EXISTS {collection}.{table_name}
             (
 
                 `symbol_id` String CODEC(ZSTD(3)),
@@ -157,9 +159,9 @@ class DBHelper:
             datetime)
             SETTINGS index_granularity = 8192;
             """
-        elif table_name == "1d":
+        elif table_name == "merged_1d":
             sql = f"""
-                CREATE TABLE IF NOT EXISTS {collection}.`1d`
+                CREATE TABLE IF NOT EXISTS {collection}.`{table_name}`
                 (
 
                     `symbol_id` String CODEC(ZSTD(3)),
@@ -201,9 +203,9 @@ class DBHelper:
                 datetime)
                 SETTINGS index_granularity = 8192;
             """
-        elif table_name == "1m":
+        elif table_name == "merged_1m":
             sql = f"""
-                CREATE TABLE IF NOT EXISTS {collection}.`1m`
+                CREATE TABLE IF NOT EXISTS {collection}.`{table_name}`
                 (
 
                     `symbol_id` String CODEC(ZSTD(3)),
@@ -243,12 +245,31 @@ class DBHelper:
                 datetime)
                 ORDER BY (symbol_id,
                 datetime)
+                SETTINGS index_granularity = 8192;
+            """
+        elif table_name == "merged":
+            sql = f"""
+                CREATE TABLE IF NOT EXISTS {collection}.`{table_name}`
+                (
+                    `symbol_id` String CODEC(ZSTD(3)),
+                    `type` String CODEC(ZSTD(3)),
+                    `date` Date CODEC(DoubleDelta, ZSTD(3)),
+                    `instrument_type` String CODEC(ZSTD(3)),
+                    `status` Nullable(UInt8) DEFAULT 0 CODEC(ZSTD(3))
+                    
+                )
+                ENGINE = ReplacingMergeTree
+                PARTITION BY sipHash64(type) % 256
+                PRIMARY KEY (symbol_id, date, type)
+                ORDER BY (symbol_id, date, type)
                 SETTINGS index_granularity = 8192;
             """
         cls.writer_conn.execute(sql)
 
     @classmethod
-    def clear_writer_table(cls, table: Literal["1d", "1m", "tick"]):
+    def clear_writer_table(
+        cls, table: Literal["merged_1d", "merged_1m", "merged_tick", "merged"]
+    ):
         clear_sql = f" truncate table default.`{table}`"
         cls.writer_conn.execute(clear_sql)
 
@@ -286,7 +307,21 @@ class DBHelper:
         """
         获取主力合约代码
         """
-        sql = f"""
+        sql_xt = f"""
+                SELECT symbol_id 
+                FROM xt.`1d`
+                WHERE (open_interest,settlement_price) in (
+                    SELECT open_interest,settlement_price 
+                    FROM xt.`1d` d 
+                    WHERE symbol_id = '{product}9999.{exchange}'
+                    AND `datetime` = '{date} 00:00:00'
+                )
+                AND `datetime` = '{date} 00:00:00'
+                AND symbol_id LIKE '%.{exchange}%'
+                AND symbol_id != '{product}9999.{exchange}'
+                AND symbol_id != '{product}8888.{exchange}';
+        """
+        sq_jq = f"""
                 SELECT symbol_id 
                 FROM jq.`1d`
                 WHERE (open_interest,avg) in (
@@ -301,10 +336,15 @@ class DBHelper:
                 AND symbol_id != '{product}8888.{exchange}';
         """
         with cls.lock:
-            rows = cls.conn_reader.execute(sql, columnar=True)
+            rows = cls.conn_reader.execute(sql_xt, columnar=True)
+        if not rows:
+            with cls.lock:
+                rows = cls.conn_reader.execute(sq_jq, columnar=True)
         assert rows, "没有主力合约数据"
         assert len(rows[0]) == 1, f"主力合约数量不唯一,得到{rows[0]}"
         major_contract = rows[0][0]
+        if isinstance(major_contract, np.str_):
+            return major_contract.__str__()
         return major_contract
 
     @classmethod
@@ -331,7 +371,11 @@ class DBHelper:
         with cls.lock:
             rows = cls.conn_reader.execute(sql, columnar=True)
         assert rows, "没有次主力合约数据"
-        assert len(rows[0]) == 2, f"次主力合约数量不确定, 仅包含{len(rows[0])}个"
+        assert (
+            len(rows[0]) == 2
+        ), f"{product}-{exchange}-{date}次主力合约数量不确定, 仅包含{len(rows[0])}个"
+        if isinstance(rows[0][1], np.str_):
+            return rows[0][1].__str__()
         return rows[0][1]
 
     @classmethod
@@ -362,6 +406,8 @@ class DBHelper:
                     idx += 1
                     continue
                 snapshot[idx] = np.array(row[0][2:], dtype=np.float64)
+                # volume要替换为0, 每日重新结算
+                snapshot[idx, -2] = 0
                 idx += 1
         return snapshot
 
@@ -381,10 +427,11 @@ class DBHelper:
         with cls.lock:
             rows = cls.conn_reader.execute(sql, columnar=True)
         if not rows:
-            # logger.warning(f"No data found for {symbols} on {date}")
+            logger.error(f"No data found for {symbols} on {date}")
             raise AssertionError(f"No data found for {symbols} on {date}")
         if fields == "*":
-            columns_info = cls.conn_reader.execute("DESCRIBE TABLE jq.`tick`")
+            with cls.lock:
+                columns_info = cls.conn_reader.execute("DESCRIBE TABLE jq.`tick`")
             schemas = [column[0] for column in columns_info]
         else:
             schemas = fields.split(",")
@@ -423,95 +470,220 @@ class DBHelper:
         return product_dict
 
     @classmethod
-    def get_index_dict(cls) -> dict[str, str]:
+    def get_product_dict_clickhouse(
+        cls, kind: Literal["FUTURES", "OPTIONS"] = "FUTURES"
+    ) -> dict[str, str]:
         """
         获得所有产品和交易所组成的字典
         """
         with cls.lock:
-            rows = cls.cursor_1d.execute(
-                "SELECT name FROM sqlite_master WHERE type='table';"
-            ).fetchall()
-        product_dict = {}
-        for row in rows:
-            product_name, exchange_name = row[0].split("_")
-            if product_name not in product_dict and "8888" in product_name:
-                product_dict[product_name] = exchange_name
-        return product_dict
+            sql = f"""
+                select
+                    distinct extract(symbol_id, '(^[a-zA-Z]+)\\d+.([A-Z]+)$') as lt,
+                    extract(symbol_id, '\\.([A-Z]+)$') AS exchange_code
+                from
+                    jq.Symbols
+                where
+                    instrument_type = '{kind}'
+        """
+            result = DBHelper.conn_reader.execute(sql, columnar=True)
+        return {str(result[0][i]): str(result[1][i]) for i in range(len(result[0]))}
+
+    @classmethod
+    def get_three_kinds_dic(cls, kind: Literal["9999", "8888", "7777"]):
+        """
+        获得clickhouse中有的主连|指数|次主力连所有产品和交易所组成的字典
+        """
+        sql = f"""
+            select
+                distinct extract(symbol_id, '(^[a-zA-Z]+)\\d+.([A-Z]+)$') as lt,
+                extract(symbol_id, '\\.([A-Z]+)$') AS exchange_code
+            from
+                jq.Symbols
+            where
+                instrument_type = 'FUTURES'
+                AND symbol_id like '%{kind}%'
+                """
+        with cls.lock:
+            result = DBHelper.conn_reader.execute(sql, columnar=True)
+        return {str(result[0][i]): str(result[1][i]) for i in range(len(result[0]))}
+
+    @classmethod
+    def get_option_symbols(cls, kind: Literal["1d", "1m"]) -> list[str]:
+        """
+        获得所有未处理的期权合约id
+        """
+        sql = f"""
+            select
+                distinct symbol_id,
+            from
+                jq.Symbols
+            where
+                instrument_type = 'OPTIONS'
+        """
+        processed_symbols = cls.get_processed_option_symbols(kind)
+        with cls.lock:
+            result = DBHelper.conn_reader.execute(sql, columnar=True)
+        return [str(s) for s in result[0] if s not in processed_symbols]
+
+    @classmethod
+    def get_expired_date(cls, symbol_id: str) -> str:
+        """
+        获得期权到期日
+        """
+        sql = f"""
+            select
+                end_date
+            from
+                jq.Symbols
+            where
+                symbol_id = '{symbol_id}'
+        """
+        with cls.lock:
+            result = DBHelper.conn_reader.execute(sql, columnar=True)
+        return str(result[0][0])
+
+    @classmethod
+    def get_processed_option_symbols(cls, kind: Literal["1d", "1m"]) -> list[str]:
+        """
+        获得所有已经处理过的期权合约id
+        """
+        sql = f"""
+            select
+                distinct symbol_id
+            from
+                default.merged
+            where
+                instrument_type = 'option'
+                AND status = 1
+                AND type = '{kind}'
+        """
+        with cls.lock:
+            result = DBHelper.writer_conn.execute(sql, columnar=True)
+        return result[0]
+
+    @classmethod
+    def get_index_dict(cls) -> dict[str, str]:
+        """
+        获得所有指数产品和交易所组成的字典
+        """
+        return cls.get_three_kinds_dic("8888")
 
     @classmethod
     def get_mayjor_dict(cls) -> dict[str, str]:
         """
-        获得所有产品和交易所组成的字典
+        获得所有主连产品和交易所组成的字典
         """
-        with cls.lock:
-            rows = cls.cursor_1d.execute(
-                "SELECT name FROM sqlite_master WHERE type='table';"
-            ).fetchall()
-        product_dict = {}
-        for row in rows:
-            product_name, exchange_name = row[0].split("_")
-            if product_name not in product_dict and "9999" in product_name:
-                product_dict[product_name] = exchange_name
-        return product_dict
+        return cls.get_three_kinds_dic("9999")
 
     @classmethod
     def get_secondery_dict(cls) -> dict[str, str]:
         """
-        获得所有产品和交易所组成的字典
+        获得所有次主力连产品和交易所组成的字典
         """
-        with cls.lock:
-            rows = cls.cursor_1d.execute(
-                "SELECT name FROM sqlite_master WHERE type='table';"
-            ).fetchall()
-        product_dict = {}
-        for row in rows:
-            product_name, exchange_name = row[0].split("_")
-            if product_name not in product_dict and "7777" in product_name:
-                product_dict[product_name] = exchange_name
-        return product_dict
+        return cls.get_three_kinds_dic("7777")
 
     @classmethod
-    def get_pro_dates(cls, product: str, exchange: str) -> list:
+    @timeit
+    def get_pro_dates(
+        cls,
+        product: str,
+        exchange: str,
+        symbol_type: Literal["9999", "8888", "7777"],
+        kind: Literal["1d", "1m", "tick"],
+    ) -> list:
         """
         获取指定品种的交易日列表, 以日线交易日列表为基准
         """
-        query_1d = f"SELECT distinct Date(datetime) as date FROM {product}_{exchange} order by datetime asc"
-        with cls.lock:
-            df = pd.read_sql(query_1d, cls.conn_1d, columns=["datetime"])
-        date = df["date"].tolist()
-        symbol_id = (
+        symbol_id = f"{product}{symbol_type}.{exchange}"
+        last_date = cls.get_last_date(symbol_id, kind)
+        symbol_pat = (
             f"{product}___.{exchange}"
             if exchange == "CZCE"
             else f"{product}____.{exchange}"
         )
-        query_tick_start = f"SELECT Date(datetime) as date FROM jq.tick where symbol_id like '{symbol_id}' and toDate(datetime) >= '{date[0]}' order by datetime asc limit 1"
-        query_tick_end = f"SELECT Date(datetime) as date FROM jq.tick where symbol_id like '{symbol_id}' and toDate(datetime) <= '{date[-1]}' order by datetime desc limit 1"
+        query_dates = f"""
+                    SELECT
+                        distinct Date(datetime) as date
+                    FROM
+                        jq.tick
+                    WHERE
+                        symbol_id like '{symbol_pat}'
+                    order by
+                        date asc
+        """
+        if last_date:
+            query_dates = f"""
+                        SELECT
+                            distinct Date(datetime) as date
+                        FROM
+                            jq.tick
+                        where
+                            Date(datetime) > '{last_date}'
+                            and symbol_id like '{symbol_pat}'
+                        order by
+                            date asc"""
         with cls.lock:
             try:
-                start_date = str(cls.conn_reader.execute(query_tick_start)[0][0])
-                end_date = str(cls.conn_reader.execute(query_tick_end)[0][0])
+                day_date = cls.conn_reader.execute(query_dates, columnar=True)[0]
             except IndexError:
                 logger.error(f"No data found for {product} of {exchange}")
                 raise AssertionError
-        try:
-            start_index = date.index(start_date)
-        except ValueError:
-            start_index = 0
-        try:
-            end_index = date.index(end_date) if end_date != date[-1] else len(date)
-        except ValueError:
-            end_index = len(date)
-        date = date[start_index:end_index]
-        return date
+        dates = [str(d) for d in day_date]
+        return dates
+
+    @classmethod
+    def get_sym_dates(
+        cls,
+        symbol_id: str,
+        kind: Literal["1d", "1m", "tick"],
+        table: Literal["1d", "1m", "tick"] = "tick",
+    ) -> list:
+        last_date = cls.get_last_date(symbol_id, kind)
+        query_1d = f"""
+                    SELECT
+                        distinct Date(datetime) as date
+                    FROM
+                        jq.{table}
+                    WHERE
+                        symbol_id = '{symbol_id}'
+                    order by
+                        datetime asc
+        """
+        if last_date:
+            query_1d = f"""
+                        SELECT
+                            distinct Date(datetime) as date
+                        FROM
+                            jq.{table}
+                        where
+                            Date(datetime) > '{last_date}'
+                            and symbol_id = '{symbol_id}'
+                        order by
+                            datetime asc"""
+        with cls.lock:
+            try:
+                day_date = cls.conn_reader.execute(query_1d, columnar=True)[0]
+            except IndexError:
+                logger.error(f"No data found for {symbol_id}")
+                raise AssertionError
+        dates = [str(d) for d in day_date]
+        return dates
 
     @classmethod
     def get_last_trading_day(cls, date: str) -> str:
         """
         获取上一个交易日
         """
-        sql = f"SELECT MAX(DATE(datetime)) as last_trading_day FROM a_DCE WHERE datetime < '{date} 00:00:00'"
+        sql = f"SELECT MAX(DATE(datetime)) as last_trading_day FROM jq.1d WHERE symbol_id = 'a9999.DCE' AND datetime < '{date} 00:00:00'"
         with cls.lock:
-            last_trading_day = cls.conn_1d.execute(sql).fetchall()[0][0]
+            try:
+                last_trading_day = cls.conn_reader.execute(sql, columnar=True)[0][
+                    0
+                ].__str__()
+            except IndexError:
+                logger.warning(f"No trading date before {date}")
+                return date
         return last_trading_day
 
     @classmethod
@@ -519,8 +691,8 @@ class DBHelper:
         cls,
         symbol_id: str,
         df: pl.DataFrame | pd.DataFrame,
-        table: Literal["tick", "1d", "1m"],
-        date: str | tuple[str, str] = "all",
+        table: Literal["merged_tick", "merged_1d", "merged_1m"],
+        date: Union[str, tuple[str, str]] = "all",
     ):
         """
         保存数据到sqlite数据库
@@ -546,46 +718,75 @@ class DBHelper:
         sql = f"select symbol_id from {product}_{exchange} where datetime = '{date} 00:00:00';"
         with cls.lock:
             rows = cls.cursor_1d.execute(sql).fetchall()
-        symbol_ids = List.empty_list(numba.types.unicode_type)
+        symbol_ids = []
         for row in rows:
             symbol_ids.append(row[0])
         return symbol_ids
 
     @classmethod
-    def insert_records(cls, record: Union[dict, list]):
+    def get_all_contracts_clickhouse(
+        cls, product: str, exchange: str, date: str = "2024-07-19"
+    ) -> np.ndarray:
         """
-        记录已经处理过的数据日期到mongodb
+        获取所有合约
+        """
+        symbol_pat = (
+            f"{product}___.{exchange}"
+            if exchange == "CZCE"
+            else f"{product}____.{exchange}"
+        )
+        sql = f"""
+                select
+                    symbol_id
+                from
+                    jq.1d
+                where
+                    datetime = '{date} 00:00:00'
+                    and symbol_id like '%{symbol_pat}'
+                    and symbol_id != '{product}9999.{exchange}'
+                    and symbol_id != '{product}7777.{exchange}'
+                    and symbol_id != '{product}8888.{exchange}';
+        """
+        with cls.lock:
+            result = DBHelper.conn_reader.execute(sql, columnar=True)
+        assert result, "没有合约数据"
+        return [str(r) for r in result[0]]
+
+    @classmethod
+    def insert_records(cls, record: Union[tuple, list]):
+        """
+        记录已经处理过的数据日期到clickhouse
         """
         with cls.lock:
             if isinstance(record, list):
+                values = []
                 for r in record:
-                    if cls.record_conn.find_one(r):
-                        logger.warning(f"Record {r} already exists in mongodb.")
-                        continue
-                    cls.record_conn.insert_one(r)
+                    sql = f"insert into merged (symbol_id, type, date, instrument_type,status) values {r};"
+                    cls.writer_conn.execute(sql)
             else:
-                if cls.record_conn.find_one(record):
-                    logger.warning(f"Record {record} already exists in mongodb.")
-                    return
-                cls.record_conn.insert_one(record)
+                sql = f"insert into merged (symbol_id, type, date,instrument_type,status) values {record};"
+                cls.writer_conn.execute(sql)
 
     @classmethod
     def update_records(cls, record: Union[dict, list]):
         """
-        更新已经处理过的数据日期到mongodb
+        更新已经处理过的数据日期到clickhouse
         """
+        cls.insert_records(record)
+
+    @classmethod
+    def process_from_date(
+        cls, date: str, symbol_id: str, kind: Literal["tick", "1m", "1d"]
+    ):
+        """
+        从指定日期开始处理数据. 通过手动插入record, 来控制数据处理的开始日期
+        """
+        record = (symbol_id, kind, date)
+        if cls.is_processed(record):
+            logger.warning(f"{symbol_id} of {date} already processed")
+            return
         with cls.lock:
-            if isinstance(record, list):
-                for r in record:
-                    date_range = r["date"]
-                    del r["date"]
-                    cls.record_conn.update_one(r, {"$set": {"date": date_range}})
-                    logger.info(f"Updated records {r} in mongodb.")
-            else:
-                date_range = record["date"]
-                del record["date"]
-                cls.record_conn.update_one(record, {"$set": {"date": date_range}})
-                logger.info(f"Updated record {record} in mongodb.")
+            cls.insert_records(record)
 
     @classmethod
     def is_processed(cls, record) -> bool:
@@ -593,7 +794,9 @@ class DBHelper:
         判断某个产品的某天数据是否已经处理过
         """
         with cls.lock:
-            is_processed = bool(cls.record_conn.find_one(record))
+            sql = f"select count(*) as count from default.merged where symbol_id = '{record[0]}' and type = '{record[1]}' and date = '{record[2]}';"
+            count = cls.writer_conn.execute(sql, columnar=True)[0][0]
+            is_processed = count > 0
         return is_processed
 
     @classmethod
@@ -643,7 +846,7 @@ class DBHelper:
     @classmethod
     def extract_three_kinds_1d(cls, kind: Literal["9999", "8888", "7777"]):
         """
-        提取日线index数据的symbl_id, datetime字段, 并按照产品分组, 保存到sqlite临时数据库
+        提取单个类别日线数据的symbl_id, datetime字段, 并按照产品分组, 保存到sqlite临时数据库
         """
         condition = f"where symbol_id like '%{kind}%' and paused = 0 and volume > 0;"
         df = cls.get_1d_dat(condition)
@@ -651,18 +854,111 @@ class DBHelper:
         logg = setup_logger("day", "1d_extract.log")
         for pro, dat in product_gro:
             product = f"{pro[0]}{kind}"
-            record = {"product": f"{product}", "date": "all", "type": "day"}
-            if cls.is_processed(record):
-                logg.warning(f"{product} of {dat['exchange'][0]} already processed")
-                continue
             exchange = dat["exchange"][0]
             dat = dat.drop("pro_part")
             dat = dat.sort("datetime")
             cls.save_1d_dat(dat, product, exchange)
-            cls.insert_records(record)
             logg.info(
                 f"Saved {product} of {exchange} data to future_1d.db successfully"
             )
+
+    @classmethod
+    @timeit
+    def extract_1d_1pro(
+        cls,
+        product: str,
+        exchange: str,
+        range_type: Literal["all", "last_date"],
+        symbol_type: Literal["9999", "8888", "7777", None] = None,
+        kind: Literal["tick", "1m", "1d", None] = None,
+    ):
+        """
+        提取单个产品的日线数据的symbl_id, datetime字段, 保存到sqlite临时数据库
+        @parameter
+        product: 产品代码
+        exchange: 交易所代码
+        range_type: 提取类型, all: 提取所有数据, last_date: 从recorde表中获取最后日期开始提取
+        symbol_type: 合约类型, 9999: 主连合约, 8888: 指数合约, 7777: 次主连合约, 只有last_date时才需要提供
+        kind: 数据类型, tick: 盘口数据, 1m: 1分钟数据, 1d: 日线数据, 只有last_date时才需要提供
+        """
+        if range_type == "all":
+            if exchange == "CZCE":
+                condition = f"where symbol_id like '{product}___.{exchange}' and paused = 0 and volume > 0;"
+            else:
+                condition = f"where symbol_id like '{product}____.{exchange}' and paused = 0 and volume > 0;"
+
+            df = cls.get_1d_dat(condition)
+            if df.shape[0] == 0:
+                logger.error(f"No data found for {product} of {exchange}")
+                return
+            df = df.sort("datetime")
+            cls.save_1d_dat(df, product, exchange)
+            logger.success(
+                f"Saved {product} of {exchange} data to future_1d.db successfully"
+            )
+        elif range_type == "last_date":
+            assert (
+                type is not None and kind is not None
+            ), "type and kind must be provided when range_type is last_date"
+            symbol_id = f"{product}{symbol_type}.{exchange}"
+            last_date = cls.get_last_date(symbol_id, kind)
+            if not last_date:
+                cls.extract_1d_1pro(product, exchange, "all")
+            condition = f"where symbol_id like '{product}___.{exchange}' and datetime > '{last_date} 00:00:00' and paused = 0 and volume > 0;"
+            df = cls.get_1d_dat(condition)
+            if df.shape[0] == 0:
+                logger.error(
+                    f"No data found for {product} of {exchange} where datetime > '{last_date} 00:00:00'"
+                )
+                return
+            df = df.sort("datetime")
+            cls.save_1d_dat(df, product, exchange)
+            logger.success(
+                f"Saved {product} of {exchange} data to future_1d.db successfully"
+            )
+
+    @classmethod
+    def extract_1d_all(cls):
+        """
+        从每个产品的最新记录开始, 提取所有产品的日线数据的symbl_id, datetime字段, 保存到sqlite临时数据库
+        """
+        if not cls.db_file.exists():
+            create_1d_dbfile(cls.db_file)
+        producnt_dict = cls.get_product_dict()
+        for product, exchange in producnt_dict.items():
+            cls.extract_1d_1pro(product, exchange, "last_date")
+
+    @classmethod
+    def get_pro_new_dates(
+        cls,
+        product: str,
+        exchange: str,
+        symbol_type: Literal["9999", "8888", "7777"],
+        kind: Literal["tick", "1m", "1d"],
+    ) -> list:
+        """
+        获取指定品种的最新交易日列表
+        """
+        symbol_id = f"{product}{symbol_type}.{exchange}"
+        last_date = cls.get_last_date(symbol_id, kind=kind)
+        if not last_date:
+            return cls.get_pro_dates(product, exchange)
+        else:
+            pass
+
+    @classmethod
+    def get_last_date(
+        cls,
+        symbol_id: str,
+        kind: Literal["tick", "1m", "1d"],
+    ) -> str:
+        """
+        获取最后日期
+        """
+        with cls.lock:
+            sql = f"select max(date) as last_date from merged where symbol_id = '{symbol_id}' and type = '{kind}'"
+            last_date = cls.writer_conn.execute(sql, columnar=True)[0][0]
+        return last_date
 
     @classmethod
     @timeit
@@ -678,14 +974,21 @@ class DBHelper:
             )
 
     @classmethod
-    def clear_records(cls):
+    def clear_records(cls, mapping: dict = {}):
         """
-        清空mongodb记录
+        清空clickhouse记录
         """
         with cls.lock:
-            result = cls.record_conn.delete_many({})
-            cls.logger.info(f"Deleted {result.deleted_count} records from database.")
-            return result
+            if mapping:
+                condition = []
+                for key, value in mapping.items():
+                    condition.append(f"{key} = '{value}'")
+                condition = " and ".join(condition)
+                sql = f"ALTER TABLE merged delete where {condition}"
+                cls.writer_conn.execute(sql)
+            else:
+                sql = "truncate table merged"
+                cls.writer_conn.execute(sql)
 
     @staticmethod
     def get_1m_sql(
@@ -699,14 +1002,21 @@ class DBHelper:
         """
         last_date = DBHelper.get_last_trading_day(date)
         exchange = symbol_id.split(".")[1]
-        if exchange == "CFFEX":
+        if database == "default":
+            table = "default.merged_1d"
+            tick_table = "default.merged_tick"
+        else:
+            table = f"{database}.1d"
+            tick_table = f"{database}.tick"
+        if exchange == "CFFEX" or exchange == "SSE" or exchange == "SZSE":
             sql = f"""
                 WITH
                     -- 获取前一日的收盘价
                     previous_close AS (
-                        SELECT close AS last_close
-                        FROM {database}.`1d`
+                        SELECT current AS last_close
+                        FROM {tick_table}
                         WHERE symbol_id = '{symbol_id}' AND toDate(datetime) = '{last_date}'
+                        ORDER by datetime DESC
                         LIMIT 1
                     ),
 
@@ -723,7 +1033,7 @@ class DBHelper:
                         SELECT 
                             *, ROW_NUMBER() over (order by datetime) as rn
                         FROM 
-                            {database}.tick t
+                            {tick_table} t
                         WHERE symbol_id = '{symbol_id}'
                             AND datetime BETWEEN '{date} 09:25:00' AND '{date} 15:02:00'
                     ),
@@ -862,15 +1172,15 @@ class DBHelper:
                         ELSE close
                     END
                         as close,
-                    case
-                        when datetime='{date} 11:30:00' THEN volume_diff+(SELECT volume_diff from noon_close_data)
-                        when datetime='{date} 15:00:00' THEN volume_diff+(SELECT volume_diff from last_close_data)
+                    case 
+                        when datetime='{date} 11:30:00' THEN volume_diff + COALESCE((SELECT volume_diff FROM noon_close_data), 0)
+                        when datetime='{date} 15:00:00' THEN volume_diff+COALESCE((SELECT volume_diff FROM last_close_data), 0)
                         ELSE volume_diff
                     END
                         as volume,
-                    case
-                        when datetime='{date} 11:30:00' THEN money_diff+(SELECT money_diff from noon_close_data)
-                        when datetime='{date} 15:00:00' THEN money_diff+(SELECT money_diff from last_close_data)
+                    case 
+                        when datetime='{date} 11:30:00' THEN money_diff+COALESCE((SELECT money_diff FROM noon_close_data), 0)
+                        when datetime='{date} 15:00:00' THEN money_diff+COALESCE((SELECT money_diff FROM last_close_data), 0)
                         ELSE money_diff
                     END
                         as money,
@@ -888,9 +1198,10 @@ class DBHelper:
                 WITH
                     -- 获取前一日的收盘价
                     previous_close AS (
-                        SELECT close AS last_close
-                        FROM {database}.`1d`
+                        SELECT current AS last_close
+                        FROM {tick_table}
                         WHERE symbol_id = '{symbol_id}' AND toDate(datetime) = '{last_date}'
+                        ORDER by datetime DESC
                         LIMIT 1
                     ),
 
@@ -907,7 +1218,7 @@ class DBHelper:
                         SELECT 
                             *, ROW_NUMBER() over (order by datetime) as rn
                         FROM 
-                            {database}.tick t
+                            {tick_table} t
                         WHERE symbol_id = '{symbol_id}'
                             AND datetime BETWEEN '{last_date} 16:00:00' AND '{date} 15:02:00'
                     ),
@@ -1080,16 +1391,16 @@ class DBHelper:
                     END
                         as close,
                     case 
-                        when datetime='{date} 10:15:00' THEN volume_diff+(SELECT volume_diff from mid_close_data)
-                        when datetime='{date} 11:30:00' THEN volume_diff+(SELECT volume_diff from noon_close_data)
-                        when datetime='{date} 15:00:00' THEN volume_diff+(SELECT volume_diff from last_close_data)
+                        when datetime='{date} 10:15:00' THEN volume_diff+COALESCE((SELECT volume_diff FROM mid_close_data), 0)
+                        when datetime='{date} 11:30:00' THEN volume_diff + COALESCE((SELECT volume_diff FROM noon_close_data), 0)
+                        when datetime='{date} 15:00:00' THEN volume_diff+COALESCE((SELECT volume_diff FROM last_close_data), 0)
                         ELSE volume_diff
                     END
                         as volume,
                     case 
-                        when datetime='{date} 10:15:00' THEN money_diff+(SELECT money_diff from mid_close_data)
-                        when datetime='{date} 11:30:00' THEN money_diff+(SELECT money_diff from noon_close_data)
-                        when datetime='{date} 15:00:00' THEN money_diff+(SELECT money_diff from last_close_data)
+                        when datetime='{date} 10:15:00' THEN money_diff+COALESCE((SELECT money_diff FROM mid_close_data), 0)
+                        when datetime='{date} 11:30:00' THEN money_diff+COALESCE((SELECT money_diff FROM noon_close_data), 0)
+                        when datetime='{date} 15:00:00' THEN money_diff+COALESCE((SELECT money_diff FROM last_close_data), 0)
                         ELSE money_diff
                     END
                         as money,
@@ -1105,40 +1416,35 @@ class DBHelper:
             """
         return sql
 
-    def get_1d_sql(symbol_id: str, database: Literal["jq", "xt", "default"] = "jq"):
+    @classmethod
+    def get_basic_1d_sql(
+        cls,
+        symbol_id: str,
+        condition: str = "",
+        database: Literal["jq", "xt", "default"] = "jq",
+    ) -> str:
+        """
+        获取基础日线数据sql语句
+        """
         exchange = symbol_id.split(".")[1]
-
+        if database == "default":
+            table = "default.merged_1m"
+        else:
+            table = f"{database}.1m"
         if exchange == "CFFEX":
             sql = f"""
             WITH 
-                last_date as (
-                    SELECT 
-                        toStartOfDay(datetime) as last_trade_day
-                    from {database}.`1m` m 
-                    WHERE 
-                        symbol_id = '{symbol_id}'
-                    order by last_trade_day DESC limit 1
-                ),
-                
-                last_position as (
-                    SELECT 
-                            position as last_op
-                    from {database}.tick t 
-                    WHERE toStartOfDay(datetime) = (SELECT last_trade_day from last_date)
-                    order by datetime DESC limit 1
-                ),
-
                 data_table AS( 
                     SELECT
                         *,
                         toStartOfDay(datetime) AS datetime
-                    FROM {database}.`1m`
+                    FROM {table}
                     WHERE 
-                        symbol_id = '{symbol_id}'
+                        symbol_id = '{symbol_id}' {condition}
                     order by datetime asc
                 ),
 
-            -- Step 5: Pre-aggregate minute data to handle open, close, high, and low values
+            --  Pre-aggregate minute data to handle open, close, high, and low values
                 pre_aggregated_data AS (
                     SELECT
                         toStartOfDay(datetime) as datetime ,
@@ -1154,7 +1460,7 @@ class DBHelper:
                         datetime
                 )
 
-            -- Step 6: Aggregate final daily data
+            --  Aggregate final daily data
             SELECT
                 '{symbol_id}' AS symbol_id,
                 t1.datetime,
@@ -1165,13 +1471,9 @@ class DBHelper:
                 t1.pre_close,
                 sum(t2.volume) as volume,
                 sum(t2.money) AS money,
-                any(t2.factor) AS factor,
+                COALESCE(any(t2.factor),0) AS factor,
                 any(t2.paused) AS paused,
-                CASE 
-                    when t1.datetime = (SELECT last_trade_day from last_date) then (SELECT last_op From last_position)
-                    else t1.open_interest
-                end
-                    as open_interest
+                t1.open_interest
             FROM
                 pre_aggregated_data t1
             JOIN
@@ -1191,25 +1493,10 @@ class DBHelper:
                     SELECT
                         *,
                         toStartOfDay(datetime - INTERVAL 3 hour) AS trading_date
-                    FROM {database}.`1m`
+                    FROM {table}
                     WHERE 
-                        symbol_id = '{symbol_id}'
+                        symbol_id = '{symbol_id}' {condition}
                     order by datetime asc
-                ),
-
-                last_date as (
-                    SELECT 
-                        toStartOfDay(datetime) as last_trade_day
-                    from data_table 
-                    order by last_trade_day DESC limit 1
-                ),
-                -- 有一个问题, 如果是到期日, 则最后一天的op应该为0
-                last_position as (
-                    SELECT 
-                            position as last_op
-                    from {database}.tick t 
-                    WHERE toStartOfDay(datetime) = (SELECT last_trade_day from last_date)
-                    order by datetime DESC limit 1
                 ),
                 
                 -- Step 1: Identify distinct trading sessions
@@ -1283,13 +1570,9 @@ class DBHelper:
                 t1.pre_close,
                 sum(t2.volume) AS volume,
                 sum(t2.money) AS money,
-                any(t2.factor) AS factor,
+                COALESCE(any(t2.factor),0) AS factor,
                 any(t2.paused) AS paused,
-                CASE 
-                    when t1.trading_day = (SELECT last_trade_day from last_date) then (SELECT last_op From last_position)
-                    else t1.open_interest
-                end
-                    as open_interest
+                t1.open_interest
             FROM 
                 pre_aggregated_data t1
             JOIN 
@@ -1303,6 +1586,96 @@ class DBHelper:
 
         """
         return sql
+
+    @classmethod
+    def get_1d_sql(
+        cls,
+        symbol_id: str,
+        date: str,
+        database: Literal["jq", "xt", "default"] = "jq",
+    ):
+        """获取一天的拼日线的sql语句"""
+        exchange = symbol_id.split(".")[1]
+        last_date = cls.get_last_trading_day(date)
+
+        if exchange == "CFFEX":
+            condition = f"AND datetime = '{date} 00:00:00'"
+            return cls.get_basic_1d_sql(symbol_id, condition, database)
+        condition = f"AND datetime BETWEEN '{last_date} 20:55:00' AND '{date} 15:00:02'"
+        return cls.get_basic_1d_sql(symbol_id, condition, database)
+
+    @classmethod
+    def get_month_1d_sql(
+        cls,
+        symbol_id: str,
+        date_start: str,
+        date_end: str,
+        database: Literal["jq", "xt", "default"] = "jq",
+    ):
+        """获取一个月的日线数据"""
+        exchange = symbol_id.split(".")[1]
+
+        if exchange == "CFFEX":
+            condition = f"AND datetime between '{date_start} 00:00:00' and '{date_end} 23:59:59'"
+            return cls.get_basic_1d_sql(symbol_id, condition, database)
+        condition = (
+            f"AND datetime BETWEEN '{date_start} 20:55:00' AND '{date_end} 15:00:02'"
+        )
+        return cls.get_basic_1d_sql(symbol_id, condition, database)
+
+    @classmethod
+    def get_settlement_price(cls, symbol_id: str, date: str) -> float:
+        """
+        获取结算价
+        """
+        sql = f"SELECT settlement_price FROM xt.1d where symbol_id='{symbol_id}' and toDate(datetime)='{date}'"
+        with cls.lock:
+            result = cls.conn_reader.execute(sql, columnar=True)
+        assert result[0], "No settlement price found"
+        return result[0][0]
+
+    @classmethod
+    def execute_1m_sql(
+        cls, symbole_id: str, date: str, database: Literal["jq", "xt", "default"] = "jq"
+    ) -> List[Tuple, Tuple]:
+        """
+        执行1分钟数据sql语句
+        """
+        sql = cls.get_1m_sql(symbole_id, date, database)
+        conn = cls.writer_conn if database == "default" else cls.conn_reader
+        with cls.lock:
+            result = conn.execute(sql, columnar=True, with_column_types=True)
+        return result
+
+    @classmethod
+    def execute_1d_sql(
+        cls, symbole_id: str, date: str, database: Literal["jq", "xt", "default"] = "jq"
+    ) -> List[Tuple, Tuple]:
+        """
+        执行日线数据sql语句
+        """
+        sql = cls.get_1d_sql(symbole_id, date, database)
+        conn = cls.writer_conn if database == "default" else cls.conn_reader
+        with cls.lock:
+            result = conn.execute(sql, columnar=True, with_column_types=True)
+        return result
+
+    @classmethod
+    def execute_month_1d_sql(
+        cls,
+        symbole_id: str,
+        date_start: str,
+        date_end: str,
+        database: Literal["jq", "xt", "default"] = "jq",
+    ) -> List[Tuple, Tuple]:
+        """
+        执行月线数据sql语句
+        """
+        sql = cls.get_month_1d_sql(symbole_id, date_start, date_end, database)
+        conn = cls.writer_conn if database == "default" else cls.conn_reader
+        with cls.lock:
+            result = conn.execute(sql, columnar=True, with_column_types=True)
+        return result
 
 
 def get_term(code: str) -> int:
@@ -1411,4 +1784,7 @@ def in_trade_times(product_comma: str, hms: int) -> bool:
 
 
 if __name__ == "__main__":
-    print(DBHelper.get_1d_sql("i8888.DCE"))
+    # print(DBHelper.clear_writer_table("merged_1d"))
+    # print(DBHelper.clear_writer_table("merged_1m"))
+    # print(DBHelper.clear_records())
+    print(DBHelper.get_mayjor_contract_id("CY", "CZCE", "2017-08-18"))
