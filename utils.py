@@ -48,9 +48,11 @@ def timeit(func):
 
 
 class DBHelper:
+    """主要用来继承管理与数据库的交互, 调用的时候要注意reader和writer的clickhouse url是否正确, 并且放在环境变量中. 注意clickhouse url 的use_numpy参数需要为True"""
+
     lock = threading.Lock()
     # clickhouse
-    reader_uri = "clickhouse://reader:d9f6ed24@172.16.7.30:9900/jq?compression=lz4&use_numpy=true"
+    reader_uri = os.environ.get("CLICKHOUSE_READER")
     conn_reader = clickhouse_driver.Client.from_url(url=reader_uri)
     # 本地数据库reader, 调试用
     reader_1d_uri = temp_dir / "future_1d.db"
@@ -62,13 +64,13 @@ class DBHelper:
         conn_1d = sqlite3.connect(reader_1d_uri, check_same_thread=False)
     cursor_1d = conn_1d.cursor()
     # 本地数据库writer, 调试用
-    writer_uri = "clickhouse://writer:echobest4@localhost:9000/default?compression=lz4&use_numpy=true"
+    writer_uri = os.environ.get("CLICKHOUSE_WRITER")
     writer_conn = ClickHouse(writer_uri, 8123)
 
     logger = setup_logger("DBHelper", "db_helper.log")
 
-    mongodb_url = "mongodb://quote_rw:rx5cb0g3myoiw30g@172.16.7.31:27027/Quote"
-    record_conn = pymongo.MongoClient(mongodb_url)["Quote"]["FutureIndex"]
+    # mongodb_url = os.environ.get("MONGODB_URL")
+    # record_conn = pymongo.MongoClient(mongodb_url)["Quote"]["FutureIndex"]
     columns_type_dict = {
         "symbol_id": str,
         "datetime": str,
@@ -275,7 +277,7 @@ class DBHelper:
 
     @classmethod
     @timeit
-    def get_mayjor_contract_dat(cls, product: str, exchange: str) -> pl.DataFrame:
+    def get_major_contract_dat(cls, product: str, exchange: str) -> pl.DataFrame:
         """
         获取主力合约数据
 
@@ -301,7 +303,7 @@ class DBHelper:
         return df
 
     @classmethod
-    def get_mayjor_contract_id(
+    def get_major_contract_id(
         cls, product: str, exchange: str, date: str = "2024-07-19"
     ) -> str:
         """
@@ -570,7 +572,7 @@ class DBHelper:
         return cls.get_three_kinds_dic("8888")
 
     @classmethod
-    def get_mayjor_dict(cls) -> dict[str, str]:
+    def get_major_dict(cls) -> dict[str, str]:
         """
         获得所有主连产品和交易所组成的字典
         """
@@ -1787,4 +1789,4 @@ if __name__ == "__main__":
     # print(DBHelper.clear_writer_table("merged_1d"))
     # print(DBHelper.clear_writer_table("merged_1m"))
     # print(DBHelper.clear_records())
-    print(DBHelper.get_mayjor_contract_id("CY", "CZCE", "2017-08-18"))
+    print(DBHelper.get_major_contract_id("CY", "CZCE", "2017-08-18"))

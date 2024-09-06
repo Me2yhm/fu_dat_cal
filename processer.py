@@ -20,10 +20,12 @@ from utils import DBHelper as db
 
 
 class Processer:
+    """集成管理数据处理部分的函数"""
+
     max_workers = 3
     max_workers_pro = 1
     FUNC_1D_DICT_MAP = {
-        "mayjor": db.get_mayjor_dict,
+        "major": db.get_major_dict,
         "index": db.get_index_dict,
         "secondery": db.get_secondery_dict,
     }
@@ -93,7 +95,7 @@ class Processer:
         return results
 
     @classmethod
-    def process_single_mayjor_all(cls, product: str, exchange: str):
+    def process_single_major_all(cls, product: str, exchange: str):
         """
         一次性处理单个主力合约的所有数据
         """
@@ -103,45 +105,33 @@ class Processer:
             Logger.warning(f"{symbol_id} of all data has been processed")
             return
         logger.info(f"Processing {symbol_id}")
-        mayjor_contract = db.get_mayjor_contract_dat(product, exchange)
-        if mayjor_contract:
-            mayjor_contract = cls.mayjor_dat_postprocess(mayjor_contract, symbol_id)
-            db.save_db(symbol_id, mayjor_contract, "merged_tick", "all")
+        major_contract = db.get_major_contract_dat(product, exchange)
+        if major_contract:
+            major_contract = cls.major_dat_postprocess(major_contract, symbol_id)
+            db.save_db(symbol_id, major_contract, "merged_tick", "all")
             db.insert_records(record)
             logger.success(f"{symbol_id} have been processed successfully")
         return symbol_id
 
     @classmethod
     @timeit
-    def process_future_mayjor(cls):
+    def process_future_major(cls, lock=None):
         """
         计算主力合约
         """
+        if lock is not None:
+            print("add lock")
+            db.lock = lock
+        print("start")
         prodct_dct = db.get_product_dict_clickhouse()
-        results = {}
-        with ThreadPoolExecutor(max_workers=cls.max_workers) as executor:
-            futures = {}
-            for product, exchange in prodct_dct.items():
-                futures[
-                    executor.submit(
-                        cls.process_single_mayjor_contract, product, exchange
-                    )
-                ] = product
-            for future in as_completed(futures):
-                product = futures[future]
-                try:
-                    processed_dates = future.result()
-                    if processed_dates is not None:
-                        results[product] = processed_dates
-                except Exception as e:
-                    logger.error(
-                        f"[{e.__class__.__name__}] Processe Error {product}: {e}"
-                    )
+        results = cls.main_thread_executor(
+            cls.process_single_major_contract, prodct_dct
+        )
         return results
 
     @classmethod
     @timeit
-    def process_single_mayjor_contract(cls, product: str, exchange: str):
+    def process_single_major_contract(cls, product: str, exchange: str):
         """
         处理单个主力合约，跳过历史第一天（没有主力合约数据）
         """
@@ -151,23 +141,21 @@ class Processer:
             logger.warning(f"{product} {exchange} has no data")
             return
         date_ranges = [date_lst[i : i + 30] for i in range(0, len(date_lst), 30)]
-        results = cls.thread_executor(
-            cls.save_1M_mayjor, date_ranges, product, exchange
-        )
+        results = cls.thread_executor(cls.save_1M_major, date_ranges, product, exchange)
         return results
 
     @classmethod
     @timeit
-    def save_1M_mayjor(cls, product: str, exchange: str, dates: list[str]):
+    def save_1M_major(cls, product: str, exchange: str, dates: list[str]):
         """
         计算一个产品一月的主力合约数据
         """
         symbol_id = f"{product}9999.{exchange}"
         assert dates, f"dates is empty"
         if len(dates) == 1:
-            mayjor_df, record = cls.save_1d_mayjor(product, exchange, dates[0])
-            assert mayjor_df is not None, f"{symbol_id}-{dates[0]} has no data"
-            db.save_db(symbol_id, mayjor_df, "merged_tick", dates[0])
+            major_df, record = cls.save_1d_major(product, exchange, dates[0])
+            assert major_df is not None, f"{symbol_id}-{dates[0]} has no data"
+            db.save_db(symbol_id, major_df, "merged_tick", dates[0])
             db.insert_records(record)
             logger.success(
                 f"{symbol_id} of {dates[0]} data have been processed successfully"
@@ -175,20 +163,20 @@ class Processer:
             return dates[0], dates[0]
         else:
             records = []
-            mayjor_dfs = []
+            major_dfs = []
             try:
                 for date in dates:
-                    mayjor_df, record = cls.save_1d_mayjor(product, exchange, date)
-                    assert mayjor_df is not None, f"{symbol_id}-{date} has no data"
-                    mayjor_dfs.append(mayjor_df)
+                    major_df, record = cls.save_1d_major(product, exchange, date)
+                    assert major_df is not None, f"{symbol_id}-{date} has no data"
+                    major_dfs.append(major_df)
                     records.append(record)
             except Exception as e:
                 logger.error(f"[{e.__class__.__name__}] {symbol_id}-{date} error:{e}")
-                if mayjor_dfs:
-                    mayjor_df = pl.concat(mayjor_dfs, how="vertical_relaxed")
+                if major_dfs:
+                    major_df = pl.concat(major_dfs, how="vertical_relaxed")
                     db.save_db(
                         symbol_id,
-                        mayjor_df,
+                        major_df,
                         "merged_tick",
                         (records[0][2], records[-1][2]),
                     )
@@ -197,9 +185,9 @@ class Processer:
                         f"{symbol_id} from {records[0][2]} to {records[-1][2]} have been processed successfully"
                     )
                 raise AssertionError(f"{e}")
-            if mayjor_dfs:
-                mayjor_df = pl.concat(mayjor_dfs, how="vertical_relaxed")
-                db.save_db(symbol_id, mayjor_df, "merged_tick", (dates[0], dates[-1]))
+            if major_dfs:
+                major_df = pl.concat(major_dfs, how="vertical_relaxed")
+                db.save_db(symbol_id, major_df, "merged_tick", (dates[0], dates[-1]))
                 db.insert_records(records)
                 logger.success(
                     f"{symbol_id} from {dates[0]} to {dates[-1]} have been processed successfully"
@@ -207,7 +195,7 @@ class Processer:
             return dates[0], dates[-1]
 
     @classmethod
-    def save_1d_mayjor(cls, product: str, exchange: str, date: str):
+    def save_1d_major(cls, product: str, exchange: str, date: str):
         """
         存一个主力合约一天的数据
         """
@@ -219,20 +207,22 @@ class Processer:
             Logger.warning(f"{symbol_id} of {date} data has been processed")
             return None, None
         try:
-            mayjor_contract = db.get_mayjor_contract_id(product, exchange, date)
-            mayjor_df = db.get_symbols_tick([mayjor_contract], date, fields=field)
+            major_contract = db.get_major_contract_id(product, exchange, date)
+            major_df = db.get_symbols_tick([major_contract], date, fields=field)
         except AssertionError as e:
             logger.error(f"{product} {exchange} {date} error:{e}")
             return None, None
-        mayjor_df = cls.mayjor_dat_postprocess(mayjor_df, symbol_id)
-        return mayjor_df, record
+        major_df = cls.major_dat_postprocess(major_df, symbol_id)
+        return major_df, record
 
     @classmethod
     @timeit
-    def process_future_index(cls):
+    def process_future_index(cls, lock=None):
         """
         计算期货指数主函数
         """
+        if lock is not None:
+            db.lock = lock
         prodct_dct = db.get_product_dict_clickhouse()
         results = {}
         with ThreadPoolExecutor(max_workers=cls.max_workers) as executor:
@@ -367,10 +357,12 @@ class Processer:
         return index_df, record
 
     @classmethod
-    def process_future_secondery(cls):
+    def process_future_secondery(cls, lock=None):
         """
         计算期货次主连合约
         """
+        if lock is not None:
+            db.lock = lock
         prodct_dct = db.get_product_dict_clickhouse()
         results = {}
         with ThreadPoolExecutor(max_workers=cls.max_workers) as executor:
@@ -484,12 +476,13 @@ class Processer:
 
     @classmethod
     def process_future_1m(
-        cls,
-        kind: Literal["9999", "8888", "7777"] = "8888",
+        cls, kind: Literal["9999", "8888", "7777"] = "8888", lock=None
     ):
         """
         处理期货指数分钟线数据
         """
+        if lock:
+            db.lock = lock
         product_dct = db.get_three_kinds_dic(kind)
         assert product_dct, f"kind {kind} has no data"
         results = cls.main_thread_executor(
@@ -587,10 +580,12 @@ class Processer:
         return index_df, record
 
     @classmethod
-    def process_option_1m(cls):
+    def process_option_1m(cls, lock=None):
         """
         处理期权1分钟线数据
         """
+        if lock:
+            db.lock = lock
         opt_lst = db.get_option_symbols("1m")
         assert opt_lst, "no option symbols"
         results = cls.main_thread_executor(cls.process_single_option_1m, opt_lst)
@@ -690,10 +685,14 @@ class Processer:
         return index_df, record
 
     @classmethod
-    def process_future_1d(cls, kind: Literal["9999", "8888", "7777"] = "8888"):
+    def process_future_1d(
+        cls, kind: Literal["9999", "8888", "7777"] = "8888", lock=None
+    ):
         """
         处理期货指数日线数据
         """
+        if lock:
+            db.lock = lock
         pro_dic = db.get_three_kinds_dic(kind)
         results = cls.main_thread_executor(cls.process_single_future_1d, pro_dic, kind)
         return results
@@ -747,10 +746,12 @@ class Processer:
         return dates
 
     @classmethod
-    def process_option_1d(cls):
+    def process_option_1d(cls, lock=None):
         """
         处理期权日线数据
         """
+        if lock:
+            db.lock = lock
         opt_lst = db.get_option_symbols("1d")
         assert opt_lst, "no option symbols"
         results = cls.main_thread_executor(cls.process_single_option_1d, opt_lst)
@@ -935,20 +936,20 @@ class Processer:
         return secondery_dat
 
     @classmethod
-    def mayjor_dat_postprocess(
-        cls, mayjor_dat: pl.DataFrame, symbol_id: str
+    def major_dat_postprocess(
+        cls, major_dat: pl.DataFrame, symbol_id: str
     ) -> pd.DataFrame:
         """
         主力合约后处理
         """
-        mayjor_dat = mayjor_dat.with_columns(
+        major_dat = major_dat.with_columns(
             pl.lit(symbol_id).alias("symbol_id"),
             pl.col("volume").cast(pl.Int64).alias("volume"),
             pl.col("position").cast(pl.Int64).alias("position"),
             pl.col("a1_v").cast(pl.Int64).alias("a1_v"),
             pl.col("b1_v").cast(pl.Int64).alias("b1_v"),
         ).sort(by="datetime")
-        return mayjor_dat
+        return major_dat
 
     @classmethod
     def opt_dat_preprocess(cls, rows: tuple) -> list:
@@ -1021,7 +1022,6 @@ def cal_value(snapshot: np.ndarray, datetime: float, high: float, low: float):
 
 if __name__ == "__main__":
     try:
-        db.execute_1d_extract()
         logger.remove()
         logger.add(sys.stderr, level="SUCCESS")
         logger.add("logs/index.log", level="ERROR", rotation="10 MB")
@@ -1030,5 +1030,4 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"[{e.__class__.__name__}] Error:: {e}")
     finally:
-        db.delete_1d_dbfile()
         pass
