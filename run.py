@@ -2,9 +2,10 @@ import multiprocessing
 import sys
 from typing import Literal
 
+from loguru import logger
+
 from processer import Processer
 from utils import DBHelper as db
-from loguru import logger
 
 FUNC_MAP = {
     "index_tick": Processer.process_future_index,

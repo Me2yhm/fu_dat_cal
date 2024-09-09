@@ -1,22 +1,21 @@
-import os
 import sys
-from typing import Literal, Union
-import polars as pl
-import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Literal
+
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+import pandas as pd
+import polars as pl
 from loguru import logger
+from numba import njit
 
-from numba import njit, types
-
+from logger import Logger
+from utils import DBHelper as db
 from utils import (
     get_hms,
     get_product_comma,
     in_trade_times,
     timeit,
 )
-from logger import Logger
-from utils import DBHelper as db
 
 
 class Processer:
@@ -151,7 +150,7 @@ class Processer:
         计算一个产品一月的主力合约数据
         """
         symbol_id = f"{product}9999.{exchange}"
-        assert dates, f"dates is empty"
+        assert dates, "dates is empty"
         if len(dates) == 1:
             major_df, record = cls.save_1d_major(product, exchange, dates[0])
             assert major_df is not None, f"{symbol_id}-{dates[0]} has no data"
@@ -267,10 +266,10 @@ class Processer:
         计算一个产品一月的指数数据
         """
         symbol_id = f"{product}8888.{exchange}"
-        assert dates, f"dates is empty"
+        assert dates, "dates is empty"
         if len(dates) == 1:
             index_df, record = cls.save_1d_index(product, exchange, dates[0])
-            assert index_df is not None, f"{symbol_id}-{date} has no data"
+            assert index_df is not None, f"{symbol_id}-{dates[0]} has no data"
             db.save_db(symbol_id, index_df, "merged_tick", dates[0])
             db.insert_records(record)
             logger.success(
@@ -409,10 +408,10 @@ class Processer:
         计算一个主力合约一月的次主力合约数据
         """
         symbol_id = f"{product}7777.{exchange}"
-        assert dates, f"dates is empty"
+        assert dates, "dates is empty"
         if len(dates) == 1:
             secondery_df, record = cls.save_1d_secondery(product, exchange, dates[0])
-            assert secondery_df is not None, f"{symbol_id}-{date} has no data"
+            assert secondery_df is not None, f"{symbol_id}-{dates[0]} has no data"
             db.save_db(symbol_id, secondery_df, "merged_tick", dates[0])
             db.insert_records(record)
             logger.success(
@@ -519,7 +518,7 @@ class Processer:
         """
         计算一个合约的一个月的分钟线数据
         """
-        assert dates, f"dates is empty"
+        assert dates, "dates is empty"
 
         if len(dates) == 1:
             index_df, record = cls.save_day_future_1m(symbol_id, dates[0])
@@ -618,7 +617,7 @@ class Processer:
         """
         计算一个月的期权1分钟线数据
         """
-        assert dates, f"dates is empty"
+        assert dates, "dates is empty"
 
         if len(dates) == 1:
             index_df, record = cls.save_day_opt_1m(symbol_id, dates[0], expired_date)
@@ -721,7 +720,7 @@ class Processer:
         """
         计算一个月的日线数据
         """
-        assert dates, f"dates is empty"
+        assert dates, "dates is empty"
         if len(dates) == 1:
             rows = db.execute_1m_sql(symbol_id, dates[0], "default")
             assert rows[0], f"{symbol_id} {dates[0]} has no 1d data"
@@ -779,7 +778,7 @@ class Processer:
         """
         计算一个月的期权日线数据
         """
-        assert dates, f"dates is empty"
+        assert dates, "dates is empty"
         if len(dates) == 1:
             rows = db.execute_1d_sql(symbol_id, dates[0], "default")
             assert rows[0], f"{symbol_id} {dates[0]} has no 1d data"

@@ -1,26 +1,25 @@
-from datetime import datetime, timedelta
 import functools
 import os
-from pathlib import Path
 import re
 import sqlite3
+import threading
 import time
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Literal, Tuple, Union
 
+import clickhouse_driver
 import numba
+import numpy as np
 import pandas as pd
 import polars as pl
-import numpy as np
-import clickhouse_driver
-import threading
-
-from numba.typed import List
 import pymongo
 import pymongo.collection
-
-from logger import Logger, setup_logger
 from jy_lib.clickhouse import ClickHouse
 from loguru import logger
+from numba.typed import List
+
+from logger import Logger, setup_logger
 
 log_root_dir = Path(__file__).parent / "log"
 temp_dir = Path(__file__).parent / "temp"
@@ -515,7 +514,7 @@ class DBHelper:
         """
         获得所有未处理的期权合约id
         """
-        sql = f"""
+        sql = """
             select
                 distinct symbol_id,
             from
